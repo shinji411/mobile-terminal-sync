@@ -21,11 +21,25 @@ const PORT = Number(process.env.CLAUDE_MOBILE_PORT ?? 3210)
 const HOST = process.env.CLAUDE_MOBILE_HOST ?? '0.0.0.0'
 const WORK_DIR = process.env.CLAUDE_MOBILE_CWD ?? homedir() + '/workspace'
 const TOKEN = getOrCreateToken()
+const CLAUDE_SESSIONS_DIR = join(homedir(), '.claude', 'sessions')
 
 type ClientData = { authed: boolean; sessionId: string | null }
 const clients = new Set<ServerWebSocket<ClientData>>()
 let seq = 0
-let isProcessing = false
+
+type SessionState = {
+  isProcessing: boolean
+  proc: ReturnType<typeof spawn> | null
+  aborted: boolean
+}
+const sessionStates = new Map<string, SessionState>()
+
+function getSessionState(sessionId: string): SessionState {
+  if (!sessionStates.has(sessionId)) {
+    sessionStates.set(sessionId, { isProcessing: false, proc: null, aborted: false })
+  }
+  return sessionStates.get(sessionId)!
+}
 
 function nextId() {
   return `a${Date.now()}-${++seq}`
@@ -50,7 +64,8 @@ function broadcastAll(data: object) {
 // --- Claude Code Invocation ---
 
 async function sendToClaude(text: string, sessionId: string) {
-  if (isProcessing) {
+  const state = getSessionState(sessionId)
+  if (state.isProcessing) {
     broadcastToSession(sessionId, { type: 'error', text: 'Claude is still thinking...' })
     return
   }
@@ -58,12 +73,19 @@ async function sendToClaude(text: string, sessionId: string) {
   const session = getSession(sessionId)
   if (!session) return
 
-  isProcessing = true
+  state.isProcessing = true
+  state.aborted = false
   broadcastToSession(sessionId, { type: 'status', status: 'thinking' })
 
-  const args = ['-p', '--output-format=stream-json', '--verbose']
+  const args = ['-p', '--output-format=stream-json', '--verbose', '--include-partial-messages']
   if (session.claudeSessionId) {
     args.push('--resume', session.claudeSessionId)
+  }
+  if ((session as any).model) {
+    args.push('--model', (session as any).model)
+  }
+  if ((session as any).permissionMode) {
+    args.push('--permission-mode', (session as any).permissionMode)
   }
 
   const proc = spawn({
@@ -73,21 +95,25 @@ async function sendToClaude(text: string, sessionId: string) {
     stdout: 'pipe',
     stderr: 'pipe',
   })
+  state.proc = proc
 
   const reader = proc.stdout.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
   let assistantMsgId: string | null = null
+  let fullText = ''
 
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
+    if (state.aborted) continue
+
     buffer += decoder.decode(value, { stream: true })
     const lines = buffer.split('\n')
     buffer = lines.pop() || ''
 
     for (const line of lines) {
-      if (!line.trim()) continue
+      if (!line.trim() || state.aborted) continue
       try {
         const data = JSON.parse(line.trim())
 
@@ -95,6 +121,23 @@ async function sendToClaude(text: string, sessionId: string) {
           updateSession(sessionId, { claudeSessionId: data.session_id })
         }
 
+        // Streaming delta
+        if (data.type === 'stream_event') {
+          const evt = data.event
+          if (evt?.type === 'content_block_start') {
+            if (!assistantMsgId) {
+              assistantMsgId = nextId()
+              fullText = ''
+              const msg: Message = { id: assistantMsgId, from: 'assistant', text: '', ts: Date.now(), sessionId }
+              broadcastToSession(sessionId, { type: 'msg', ...msg })
+            }
+          } else if (evt?.type === 'content_block_delta' && evt.delta?.text) {
+            fullText += evt.delta.text
+            broadcastToSession(sessionId, { type: 'delta', id: assistantMsgId, text: fullText })
+          }
+        }
+
+        // Complete assistant message
         if (data.type === 'assistant') {
           const content = data.message?.content
           if (!content) continue
@@ -103,6 +146,7 @@ async function sendToClaude(text: string, sessionId: string) {
             if (block.type === 'text') t += block.text
           }
           if (!t) continue
+          fullText = t
 
           if (!assistantMsgId) {
             assistantMsgId = nextId()
@@ -110,15 +154,17 @@ async function sendToClaude(text: string, sessionId: string) {
             saveMessage(msg)
             broadcastToSession(sessionId, { type: 'msg', ...msg })
           } else {
-            broadcastToSession(sessionId, { type: 'edit', id: assistantMsgId, text: t })
+            broadcastToSession(sessionId, { type: 'delta', id: assistantMsgId, text: t })
           }
         }
 
+        // Final result
         if (data.type === 'result' && data.result) {
+          fullText = data.result
           if (assistantMsgId) {
             const msg: Message = { id: assistantMsgId, from: 'assistant', text: data.result, ts: Date.now(), sessionId }
             saveMessage(msg)
-            broadcastToSession(sessionId, { type: 'edit', id: assistantMsgId, text: data.result })
+            broadcastToSession(sessionId, { type: 'complete', id: assistantMsgId, text: data.result })
           } else {
             assistantMsgId = nextId()
             const msg: Message = { id: assistantMsgId, from: 'assistant', text: data.result, ts: Date.now(), sessionId }
@@ -131,8 +177,28 @@ async function sendToClaude(text: string, sessionId: string) {
   }
 
   await proc.exited
-  isProcessing = false
+  state.proc = null
+  state.isProcessing = false
+
+  if (state.aborted && assistantMsgId && fullText) {
+    const msg: Message = { id: assistantMsgId, from: 'assistant', text: fullText + '\n\n*(interrupted)*', ts: Date.now(), sessionId }
+    saveMessage(msg)
+    broadcastToSession(sessionId, { type: 'complete', id: assistantMsgId, text: msg.text })
+  }
+
   broadcastToSession(sessionId, { type: 'status', status: 'idle' })
+}
+
+function abortClaude(sessionId: string) {
+  const state = getSessionState(sessionId)
+  if (!state.proc || !state.isProcessing) return
+  state.aborted = true
+  state.proc.kill('SIGINT')
+  setTimeout(() => {
+    if (state.proc && !state.proc.killed) {
+      state.proc.kill('SIGTERM')
+    }
+  }, 5000)
 }
 
 // --- HTTP + WebSocket Server ---
@@ -180,9 +246,61 @@ Bun.serve({
     if (url.pathname.startsWith('/api/sessions/') && req.method === 'PATCH') {
       return (async () => {
         const id = url.pathname.split('/')[3]
-        const body = await req.json() as Partial<Session>
+        const body = await req.json() as Partial<Session> & { claudeSessionId?: string }
         const session = updateSession(id, body)
         if (!session) return json({ error: 'not found' }, 404)
+
+        // If setting claudeSessionId (resume), load history from JSONL
+        if (body.claudeSessionId) {
+          const projectDirs = readdirSync(join(homedir(), '.claude', 'projects')).filter(d => !d.startsWith('.'))
+          for (const pd of projectDirs) {
+            const jsonlPath = join(homedir(), '.claude', 'projects', pd, body.claudeSessionId + '.jsonl')
+            if (existsSync(jsonlPath)) {
+              const content = readFileSync(jsonlPath, 'utf-8')
+              const lines = content.split('\n').filter(l => l.trim())
+              let msgSeq = 0
+              for (const line of lines) {
+                try {
+                  const entry = JSON.parse(line)
+                  if (entry.type === 'user' && entry.message?.role === 'user') {
+                    const c = entry.message.content
+                    if (typeof c === 'string' && !c.startsWith('<')) {
+                      msgSeq++
+                      const msg: Message = {
+                        id: `hist-u-${msgSeq}`,
+                        from: 'user',
+                        text: c,
+                        ts: entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now() - (10000 - msgSeq),
+                        sessionId: id,
+                      }
+                      saveMessage(msg)
+                    }
+                  } else if (entry.type === 'assistant') {
+                    const blocks = entry.message?.content
+                    if (Array.isArray(blocks)) {
+                      for (const block of blocks) {
+                        if (block.type === 'text' && block.text) {
+                          msgSeq++
+                          const msg: Message = {
+                            id: `hist-a-${msgSeq}`,
+                            from: 'assistant',
+                            text: block.text,
+                            ts: entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now() - (10000 - msgSeq),
+                            sessionId: id,
+                          }
+                          saveMessage(msg)
+                          break
+                        }
+                      }
+                    }
+                  }
+                } catch {}
+              }
+              break
+            }
+          }
+        }
+
         return json(session)
       })()
     }
@@ -191,6 +309,139 @@ Bun.serve({
       const id = url.pathname.split('/')[3]
       deleteSession(id)
       return json({ ok: true })
+    }
+
+    // --- Claude Code Recent Sessions (for resume) ---
+    if (url.pathname === '/api/claude-sessions') {
+      try {
+        const files = readdirSync(CLAUDE_SESSIONS_DIR).filter(f => f.endsWith('.json'))
+        const sessions = files.map(f => {
+          try {
+            const data = JSON.parse(readFileSync(join(CLAUDE_SESSIONS_DIR, f), 'utf-8'))
+            const sid = data.sessionId
+            // Find JSONL conversation file
+            const projectDirs = readdirSync(join(homedir(), '.claude', 'projects')).filter(d => !d.startsWith('.'))
+            let firstMsg = ''
+            let msgCount = 0
+            for (const pd of projectDirs) {
+              const jsonlPath = join(homedir(), '.claude', 'projects', pd, sid + '.jsonl')
+              if (existsSync(jsonlPath)) {
+                const content = readFileSync(jsonlPath, 'utf-8')
+                const lines = content.split('\n').filter(l => l.trim())
+                for (const line of lines) {
+                  try {
+                    const entry = JSON.parse(line)
+                    if (entry.type === 'user' && entry.message?.role === 'user') {
+                      msgCount++
+                      if (!firstMsg) {
+                        const c = entry.message.content
+                        if (typeof c === 'string' && !c.startsWith('<')) {
+                          firstMsg = c.slice(0, 120)
+                        }
+                      }
+                    }
+                  } catch {}
+                }
+                break
+              }
+            }
+            return {
+              sessionId: sid,
+              cwd: data.cwd,
+              startedAt: data.startedAt,
+              status: data.status,
+              kind: data.kind,
+              firstMessage: firstMsg,
+              messageCount: msgCount,
+            }
+          } catch { return null }
+        }).filter(Boolean).filter((s: any) => s.messageCount > 0).sort((a: any, b: any) => b.startedAt - a.startedAt).slice(0, 20)
+        return json(sessions)
+      } catch {
+        return json([])
+      }
+    }
+
+    // --- Session conversation context (for preview) ---
+    if (url.pathname === '/api/claude-sessions/context') {
+      const sid = url.searchParams.get('id') || ''
+      if (!sid) return json({ error: 'missing id' }, 400)
+      try {
+        const projectDirs = readdirSync(join(homedir(), '.claude', 'projects')).filter(d => !d.startsWith('.'))
+        let messages: { role: string; text: string }[] = []
+        for (const pd of projectDirs) {
+          const jsonlPath = join(homedir(), '.claude', 'projects', pd, sid + '.jsonl')
+          if (existsSync(jsonlPath)) {
+            const content = readFileSync(jsonlPath, 'utf-8')
+            const lines = content.split('\n').filter(l => l.trim())
+            for (const line of lines) {
+              try {
+                const entry = JSON.parse(line)
+                if (entry.type === 'user' && entry.message?.role === 'user') {
+                  const c = entry.message.content
+                  if (typeof c === 'string' && !c.startsWith('<')) {
+                    messages.push({ role: 'user', text: c.slice(0, 300) })
+                  }
+                } else if (entry.type === 'assistant') {
+                  const content = entry.message?.content
+                  if (Array.isArray(content)) {
+                    for (const block of content) {
+                      if (block.type === 'text') {
+                        messages.push({ role: 'assistant', text: block.text.slice(0, 300) })
+                        break
+                      }
+                    }
+                  }
+                }
+              } catch {}
+            }
+            break
+          }
+        }
+        // Return last 30 messages as context preview
+        return json({ messages: messages.slice(-30) })
+      } catch {
+        return json({ messages: [] })
+      }
+    }
+
+    // --- Recap a session (get AI summary) ---
+    if (url.pathname === '/api/claude-sessions/recap') {
+      const sid = url.searchParams.get('id') || ''
+      if (!sid) return json({ error: 'missing id' }, 400)
+      return (async () => {
+        try {
+          const proc = spawn({
+            cmd: ['claude', '-p', '--resume', sid, '--output-format=stream-json', '--verbose', '--model', 'haiku'],
+            cwd: WORK_DIR,
+            stdin: new Response('Give a brief recap of this conversation in 2-3 sentences. What were we working on and what was the last thing we did? Reply in the same language the user used.'),
+            stdout: 'pipe',
+            stderr: 'pipe',
+          })
+          const reader = proc.stdout.getReader()
+          const decoder = new TextDecoder()
+          let buffer = ''
+          let result = ''
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buffer += decoder.decode(value, { stream: true })
+            const lines = buffer.split('\n')
+            buffer = lines.pop() || ''
+            for (const line of lines) {
+              if (!line.trim()) continue
+              try {
+                const d = JSON.parse(line.trim())
+                if (d.type === 'result' && d.result) result = d.result
+              } catch {}
+            }
+          }
+          await proc.exited
+          return json({ recap: result || 'Unable to generate recap' })
+        } catch (e: any) {
+          return json({ recap: 'Error: ' + e.message })
+        }
+      })()
     }
 
     // --- File Browser API ---
@@ -254,7 +505,13 @@ Bun.serve({
           ws.data.sessionId = data.sessionId
           const history = getHistory(data.sessionId, 100)
           ws.send(JSON.stringify({ type: 'history', messages: history }))
-          ws.send(JSON.stringify({ type: 'status', status: 'idle' }))
+          ws.send(JSON.stringify({ type: 'status', status: getSessionState(data.sessionId).isProcessing ? 'thinking' : 'idle' }))
+          return
+        }
+
+        // Abort
+        if (data.type === 'abort') {
+          if (ws.data.sessionId) abortClaude(ws.data.sessionId)
           return
         }
 

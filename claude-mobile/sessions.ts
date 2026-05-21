@@ -8,6 +8,8 @@ export type Session = {
   claudeSessionId: string | null
   createdAt: number
   lastActiveAt: number
+  model: string
+  permissionMode: string
 }
 
 const SESSIONS_DIR = join(homedir(), '.claude', 'channels', 'claude-mobile', 'sessions')
@@ -43,6 +45,8 @@ export function createSession(name: string): Session {
     claudeSessionId: null,
     createdAt: Date.now(),
     lastActiveAt: Date.now(),
+    model: 'sonnet',
+    permissionMode: 'auto',
   }
   writeFileSync(sessionPath(id), JSON.stringify(session, null, 2))
   return session

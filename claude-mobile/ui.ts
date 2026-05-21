@@ -194,10 +194,13 @@ body {
   border-radius: 8px;
   padding: 10px 12px;
   overflow-x: auto;
+  max-width: 100%;
   margin: 8px 0;
   font-size: 13px;
   line-height: 1.4;
+  -webkit-overflow-scrolling: touch;
 }
+.msg pre code { white-space: pre; }
 .msg code {
   font-family: 'SF Mono', 'Fira Code', monospace;
   font-size: 13px;
@@ -213,7 +216,8 @@ body {
 .msg ul, .msg ol { padding-left: 20px; margin: 6px 0; }
 .msg blockquote { border-left: 3px solid var(--user-bubble); padding-left: 10px; margin: 6px 0; opacity: 0.8; }
 .msg h1, .msg h2, .msg h3 { margin: 10px 0 4px; font-size: 15px; font-weight: 600; }
-.msg table { border-collapse: collapse; margin: 8px 0; font-size: 13px; width: 100%; }
+.msg .table-wrapper { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 8px 0; }
+.msg table { border-collapse: collapse; font-size: 13px; white-space: nowrap; }
 .msg th, .msg td { border: 1px solid var(--input-border); padding: 4px 8px; }
 .time {
   font-size: 11px;
@@ -261,6 +265,56 @@ body {
   flex-shrink: 0;
 }
 #send:disabled { opacity: 0.4; }
+#send.abort { background: #e53935; }
+
+/* Settings panel */
+#settings-panel {
+  display: none;
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: var(--chat-bg);
+  border-top: 1px solid var(--input-border);
+  border-radius: 16px 16px 0 0;
+  padding: 20px 16px;
+  padding-bottom: calc(20px + var(--safe-bottom));
+  z-index: 150;
+  box-shadow: 0 -4px 20px rgba(0,0,0,0.15);
+}
+#settings-panel.open { display: block; }
+#settings-panel h3 { font-size: 15px; margin-bottom: 16px; }
+.setting-group { margin-bottom: 16px; }
+.setting-group label { font-size: 13px; color: var(--text-muted); display: block; margin-bottom: 6px; }
+.setting-group select {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--input-border);
+  background: var(--input-bg);
+  color: var(--text);
+  font-size: 14px;
+  appearance: none;
+}
+#settings-save {
+  width: 100%;
+  padding: 12px;
+  border-radius: 10px;
+  border: none;
+  background: var(--user-bubble);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 500;
+  cursor: pointer;
+}
+#settings-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.3);
+  z-index: 149;
+}
+#settings-overlay.open { display: block; }
 .typing {
   align-self: flex-start;
   padding: 10px 14px;
@@ -314,6 +368,8 @@ body {
 }
 #files-panel { display: none; flex: 1; overflow-y: auto; }
 #files-panel.active { display: flex; flex-direction: column; }
+#resume-panel { display: none; flex: 1; overflow-y: auto; padding: 8px; }
+#resume-panel.active { display: block; }
 #session-list.active { display: block; }
 
 /* File browser */
@@ -422,9 +478,11 @@ body {
   </div>
   <div id="sidebar-tabs">
     <button class="sidebar-tab active" onclick="switchTab('sessions')">Sessions</button>
+    <button class="sidebar-tab" onclick="switchTab('resume')">Resume</button>
     <button class="sidebar-tab" onclick="switchTab('files')">Files</button>
   </div>
   <div id="session-list" class="active"></div>
+  <div id="resume-panel"></div>
   <div id="files-panel">
     <div id="file-breadcrumb"></div>
     <div id="file-entries"></div>
@@ -436,6 +494,7 @@ body {
     <div class="dot" id="dot"></div>
     <h1 id="title">Claude Code</h1>
     <span class="status" id="status">connecting...</span>
+    <button id="settings-btn" onclick="toggleSettings()" style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--text)">⚙</button>
   </div>
   <div id="messages">
     <div id="empty-state">Select or create a session to start</div>
@@ -445,6 +504,31 @@ body {
     <textarea id="input" rows="1" placeholder="Message Claude..." autocomplete="off"></textarea>
     <button id="send" disabled>↑</button>
   </div>
+</div>
+
+<div id="settings-overlay" onclick="toggleSettings()"></div>
+<div id="settings-panel">
+  <h3>Session Settings</h3>
+  <div class="setting-group">
+    <label>Model</label>
+    <select id="model-select">
+      <option value="sonnet">Sonnet (fast)</option>
+      <option value="opus">Opus (powerful)</option>
+      <option value="haiku">Haiku (fastest)</option>
+      <option value="claude-opus-4-6">claude-opus-4-6</option>
+      <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+    </select>
+  </div>
+  <div class="setting-group">
+    <label>Permission Mode</label>
+    <select id="mode-select">
+      <option value="auto">Auto</option>
+      <option value="bypassPermissions">Bypass Permissions</option>
+      <option value="plan">Plan Mode</option>
+      <option value="default">Default (ask)</option>
+    </select>
+  </div>
+  <button id="settings-save" onclick="saveSettings()">Save</button>
 </div>
 
 <div id="file-viewer">
@@ -488,6 +572,8 @@ let ws
 let uid = 0
 let currentSessionId = null
 let sessions = []
+let isThinking = false
+let userAtBottom = true
 
 function toggleSidebar() {
   sidebar.classList.toggle('open')
@@ -509,9 +595,25 @@ function renderSessions() {
     return '<div class="session-item' + active + '" onclick="switchSession(\\'' + s.id + '\\')">' +
       '<span class="name">' + escapeHtml(s.name) + '</span>' +
       '<span class="time">' + time + '</span>' +
+      '<button class="delete-btn" onclick="event.stopPropagation();renameSessionUI(\\'' + s.id + '\\')" style="font-size:12px">✎</button>' +
       '<button class="delete-btn" onclick="event.stopPropagation();deleteSessionUI(\\'' + s.id + '\\')">&times;</button>' +
       '</div>'
   }).join('')
+}
+
+async function renameSessionUI(id) {
+  const session = sessions.find(s => s.id === id)
+  if (!session) return
+  const name = prompt('Rename session:', session.name)
+  if (!name || name === session.name) return
+  await fetch('/api/sessions/' + id, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name })
+  })
+  session.name = name
+  renderSessions()
+  if (id === currentSessionId) title.textContent = name
 }
 
 async function newSession() {
@@ -581,19 +683,33 @@ function connect() {
     } else if (data.type === 'msg') {
       emptyState.style.display = 'none'
       addMessage(data, true)
+    } else if (data.type === 'delta') {
+      const el = document.querySelector('[data-id="' + data.id + '"] .content')
+      if (el) { el.innerHTML = render(data.text); if (userAtBottom) scrollBottom() }
+    } else if (data.type === 'complete') {
+      const el = document.querySelector('[data-id="' + data.id + '"] .content')
+      if (el) { el.innerHTML = render(data.text); if (userAtBottom) scrollBottom() }
     } else if (data.type === 'edit') {
       const el = document.querySelector('[data-id="' + data.id + '"] .content')
-      if (el) { el.innerHTML = render(data.text); scrollBottom() }
+      if (el) { el.innerHTML = render(data.text); if (userAtBottom) scrollBottom() }
     } else if (data.type === 'status') {
       if (data.status === 'thinking') {
+        isThinking = true
         typing.style.display = 'block'
         dot.className = 'dot thinking'
         status.textContent = 'thinking...'
+        sendBtn.textContent = '■'
+        sendBtn.classList.add('abort')
+        sendBtn.disabled = false
         scrollBottom()
       } else {
+        isThinking = false
         typing.style.display = 'none'
         dot.className = 'dot'
         status.textContent = 'connected'
+        sendBtn.textContent = '↑'
+        sendBtn.classList.remove('abort')
+        autoResize()
       }
     }
   }
@@ -603,7 +719,11 @@ connect()
 // --- Messages ---
 
 function render(text) {
-  try { return marked.parse(text) } catch { return escapeHtml(text) }
+  try {
+    let html = marked.parse(text)
+    html = html.replace(/<table>/g, '<div class="table-wrapper"><table>').replace(/<\\/table>/g, '</table></div>')
+    return html
+  } catch { return escapeHtml(text) }
 }
 
 function addMessage(m, animate) {
@@ -640,8 +760,17 @@ function scrollBottom() {
 // --- Input ---
 
 function send() {
+  if (!ws || ws.readyState !== 1 || !currentSessionId) return
+
+  // Abort if thinking
+  if (isThinking) {
+    ws.send(JSON.stringify({ type: 'abort' }))
+    status.textContent = 'stopping...'
+    return
+  }
+
   const text = input.value.trim()
-  if (!text || !ws || ws.readyState !== 1 || !currentSessionId) return
+  if (!text) return
   const id = 'u' + Date.now() + '-' + (++uid)
   ws.send(JSON.stringify({ id, text }))
   addMessage({ id, from: 'user', text, ts: Date.now() }, true)
@@ -662,14 +791,146 @@ function autoResize() {
   sendBtn.disabled = !input.value.trim() || !ws || ws.readyState !== 1 || !currentSessionId
 }
 
+// --- Scroll detection ---
+messages.addEventListener('scroll', () => {
+  userAtBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 50
+})
+
+// --- Settings ---
+
+function toggleSettings() {
+  const panel = document.getElementById('settings-panel')
+  const overlay = document.getElementById('settings-overlay')
+  const isOpen = panel.classList.contains('open')
+  panel.classList.toggle('open')
+  overlay.classList.toggle('open')
+  if (!isOpen && currentSessionId) {
+    const session = sessions.find(s => s.id === currentSessionId)
+    if (session) {
+      document.getElementById('model-select').value = session.model || 'sonnet'
+      document.getElementById('mode-select').value = session.permissionMode || 'auto'
+    }
+  }
+}
+
+async function saveSettings() {
+  if (!currentSessionId) return
+  const model = document.getElementById('model-select').value
+  const permissionMode = document.getElementById('mode-select').value
+  await fetch('/api/sessions/' + currentSessionId, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model, permissionMode })
+  })
+  const session = sessions.find(s => s.id === currentSessionId)
+  if (session) { session.model = model; session.permissionMode = permissionMode }
+  toggleSettings()
+  status.textContent = model + ' / ' + permissionMode
+}
+
 // --- Sidebar Tabs ---
 
 function switchTab(tab) {
   document.querySelectorAll('.sidebar-tab').forEach(t => t.classList.remove('active'))
-  document.querySelector('.sidebar-tab:nth-child(' + (tab === 'sessions' ? '1' : '2') + ')').classList.add('active')
+  const idx = tab === 'sessions' ? 1 : tab === 'resume' ? 2 : 3
+  document.querySelector('.sidebar-tab:nth-child(' + idx + ')').classList.add('active')
   document.getElementById('session-list').classList.toggle('active', tab === 'sessions')
+  document.getElementById('resume-panel').classList.toggle('active', tab === 'resume')
   document.getElementById('files-panel').classList.toggle('active', tab === 'files')
   if (tab === 'files') loadFiles('')
+  if (tab === 'resume') loadClaudeSessions()
+}
+
+// --- Resume Mac Sessions ---
+
+const resumePanel = document.getElementById('resume-panel')
+
+async function loadClaudeSessions() {
+  resumePanel.innerHTML = '<div style="padding:16px;color:var(--text-muted)">Loading...</div>'
+  const res = await fetch('/api/claude-sessions')
+  const claudeSessions = await res.json()
+  if (!claudeSessions.length) {
+    resumePanel.innerHTML = '<div style="padding:16px;color:var(--text-muted)">No recent sessions found</div>'
+    return
+  }
+  resumePanel.innerHTML = claudeSessions.map(s => {
+    const time = new Date(s.startedAt).toLocaleString()
+    const dir = s.cwd.replace(/^\\/Users\\/[^/]+/, '~')
+    const preview = s.firstMessage || '(no message)'
+    return '<div class="session-item" style="flex-direction:column;align-items:flex-start;gap:4px" onclick="showSessionContext(\\'' + s.sessionId + '\\')">' +
+      '<div style="display:flex;width:100%;justify-content:space-between;align-items:center">' +
+        '<span class="name" style="font-size:13px;color:var(--text-muted)">' + dir + '</span>' +
+        '<span class="time">' + s.messageCount + ' msgs</span>' +
+      '</div>' +
+      '<div style="font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%">' + escapeHtml(preview) + '</div>' +
+      '<div style="font-size:11px;color:var(--text-muted)">' + time + '</div>' +
+      '</div>'
+  }).join('')
+}
+
+let previewSessionId = null
+
+async function showSessionContext(sessionId) {
+  previewSessionId = sessionId
+  resumePanel.innerHTML = '<div style="padding:16px;color:var(--text-muted)">Loading context...</div>'
+  const res = await fetch('/api/claude-sessions/context?id=' + sessionId)
+  const data = await res.json()
+
+  let html = '<div style="padding:8px">'
+  html += '<button onclick="loadClaudeSessions()" style="background:none;border:none;color:var(--user-bubble);font-size:14px;cursor:pointer;margin-bottom:12px">← Back</button>'
+  html += '<div style="display:flex;gap:8px;margin-bottom:12px">'
+  html += '<button onclick="resumeClaudeSession(\\'' + sessionId + '\\')" style="flex:1;padding:10px;border-radius:10px;border:none;background:var(--user-bubble);color:#fff;font-size:14px;cursor:pointer">Resume</button>'
+  html += '<button onclick="getRecap(\\'' + sessionId + '\\')" id="recap-btn" style="flex:1;padding:10px;border-radius:10px;border:1px solid var(--user-bubble);background:none;color:var(--user-bubble);font-size:14px;cursor:pointer">Recap</button>'
+  html += '</div>'
+  html += '<div id="recap-result" style="display:none;padding:10px;margin-bottom:12px;border-radius:10px;background:var(--assistant-bubble);font-size:13px;line-height:1.5"></div>'
+  html += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Recent messages (' + data.messages.length + '):</div>'
+  html += '<div style="max-height:60vh;overflow-y:auto">'
+
+  for (const m of data.messages) {
+    const isUser = m.role === 'user'
+    html += '<div style="padding:8px 10px;margin:4px 0;border-radius:12px;font-size:13px;line-height:1.4;word-break:break-word;' +
+      (isUser ? 'background:var(--user-bubble);color:#fff;margin-left:20%' : 'background:var(--assistant-bubble);color:var(--assistant-text);margin-right:20%') +
+      '">' + escapeHtml(m.text) + '</div>'
+  }
+  html += '</div></div>'
+  resumePanel.innerHTML = html
+}
+
+async function getRecap(sessionId) {
+  const btn = document.getElementById('recap-btn')
+  const result = document.getElementById('recap-result')
+  btn.textContent = 'Loading...'
+  btn.disabled = true
+  try {
+    const res = await fetch('/api/claude-sessions/recap?id=' + sessionId)
+    const data = await res.json()
+    result.textContent = data.recap
+    result.style.display = 'block'
+  } catch {
+    result.textContent = 'Failed to get recap'
+    result.style.display = 'block'
+  }
+  btn.textContent = 'Recap'
+  btn.disabled = false
+}
+
+async function resumeClaudeSession(claudeSessionId) {
+  const name = 'Resumed ' + new Date().toLocaleTimeString()
+  const res = await fetch('/api/sessions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name })
+  })
+  const session = await res.json()
+  await fetch('/api/sessions/' + session.id, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ claudeSessionId })
+  })
+  session.claudeSessionId = claudeSessionId
+  sessions.unshift(session)
+  switchSession(session.id)
+  toggleSidebar()
 }
 
 // --- File Browser ---
@@ -769,15 +1030,43 @@ function closeFileViewer() {
 
 function copyViewerPath() {
   const path = fileViewer.dataset.path
-  navigator.clipboard.writeText(path).then(() => {
-    const btn = document.querySelector('.copy-path-btn')
-    btn.textContent = 'Copied!'
-    setTimeout(() => btn.textContent = 'Copy Path', 1500)
-  })
+  copyToClipboard(path, document.querySelector('.copy-path-btn'))
 }
 
 function copyPath(path) {
-  navigator.clipboard.writeText(path).then(() => {})
+  copyToClipboard(path)
+}
+
+function copyToClipboard(text, btn) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => showCopyToast(text, btn))
+  } else {
+    // Fallback for iOS Safari
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.left = '-9999px'
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    document.body.removeChild(ta)
+    showCopyToast(text, btn)
+  }
+}
+
+function showCopyToast(text, btn) {
+  if (btn) {
+    const orig = btn.textContent
+    btn.textContent = 'Copied!'
+    setTimeout(() => btn.textContent = orig, 1500)
+  }
+  // Toast notification
+  const toast = document.createElement('div')
+  toast.textContent = 'Copied: ' + text
+  toast.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:var(--assistant-bubble);color:var(--text);padding:8px 16px;border-radius:20px;font-size:13px;z-index:999;opacity:0;transition:opacity 0.3s;max-width:80%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'
+  document.body.appendChild(toast)
+  requestAnimationFrame(() => toast.style.opacity = '1')
+  setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300) }, 2000)
 }
 
 // Init
