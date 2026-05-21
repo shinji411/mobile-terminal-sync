@@ -527,7 +527,7 @@ Bun.serve({
   },
 })
 
-process.stderr.write(`\nclaude-mobile bridge started\n`)
+process.stderr.write(`\nclaude-mobile v0.2.0 started\n`)
 process.stderr.write(`URL: http://${HOST}:${PORT}?token=${TOKEN}\n`)
 process.stderr.write(`Working directory: ${WORK_DIR}\n`)
 process.stderr.write(`\nOpen on iPhone: http://100.103.217.117:${PORT}?token=${TOKEN}\n\n`)
