@@ -1,109 +1,101 @@
 # mobile-terminal-sync
 
-Sync your Mac terminal (Claude Code / any CLI) to your iPhone in real-time. View and interact from anywhere.
+Sync your Mac Claude Code sessions to iPhone with a native chat UI — like claude.ai on your phone.
 
-## How It Works
+## Two Approaches
+
+### 1. Claude Mobile (Recommended) — Chat UI
+
+A claude.ai-like interface on your phone that syncs with Claude Code via MCP channel.
 
 ```
-┌─────────────┐     Tailscale VPN     ┌─────────────┐
-│   Mac       │◄────────────────────►│   iPhone    │
-│   tmux      │     SSH + attach      │   Termius   │
-│   session   │                       │   / Blink   │
-└─────────────┘                       └─────────────┘
+┌─────────────────┐     Tailscale      ┌─────────────────┐
+│   iPhone Safari │◄──────────────────►│   Mac           │
+│   Chat UI (PWA) │     WebSocket       │   Claude Code   │
+│   Markdown +    │                     │   + MCP Server  │
+│   Code Highlight│                     │                 │
+└─────────────────┘                     └─────────────────┘
 ```
 
-Your Mac runs a persistent tmux session. Your iPhone connects via SSH (over Tailscale for anywhere-access) and attaches to the same session. Both sides see identical output and can type input.
+Features:
+- Chat bubble UI (like claude.ai)
+- Markdown rendering + code syntax highlighting
+- Dark/light theme (follows system)
+- PWA — add to home screen for app-like experience
+- Message history persisted (SQLite)
+- Token-based auth
+- Auto-reconnect on network changes
 
-## Requirements
-
-| Component | Purpose | Install |
-|-----------|---------|---------|
-| tmux | Session persistence & sharing | `brew install tmux` |
-| Tailscale | Zero-config VPN (Mac ↔ iPhone) | [tailscale.com/download](https://tailscale.com/download) |
-| Termius / Blink Shell | iOS SSH client | App Store |
-
-## Quick Start
-
-### 1. Install (Mac)
+#### Setup
 
 ```bash
-brew install tmux
-cp tmux.conf ~/.tmux.conf
+# 1. Install Bun (if not installed)
+curl -fsSL https://bun.sh/install | bash
+
+# 2. Install the plugin in Claude Code
+claude
+/plugin install claude-mobile   # from this directory
+
+# 3. Restart Claude Code with channel enabled
+claude --channels plugin:claude-mobile
+
+# Server prints URL with token:
+# claude-mobile: http://0.0.0.0:3210?token=<your-token>
 ```
 
-### 2. Enable Remote Login (Mac)
+#### Connect from iPhone
 
-System Settings → General → Sharing → Remote Login → ON
+Open in Safari: `http://<tailscale-ip>:3210?token=<your-token>`
 
-### 3. Setup Tailscale
+Tip: Add to Home Screen for full-screen PWA experience.
 
-- Install on both Mac and iPhone
-- Login with the same account
-- Note your Mac's Tailscale IP: `tailscale ip -4`
+---
 
-### 4. Start a session (Mac)
+### 2. tmux + SSH (Fallback) — Raw Terminal
+
+For when you just need quick terminal access without the fancy UI.
 
 ```bash
-# Option A: manual
+# Mac
 tmux new -s claude
 
-# Option B: use the helper script
-./start-claude.sh
-```
-
-### 5. Connect from iPhone
-
-In Termius / Blink Shell:
-
-```bash
-ssh <username>@<tailscale-ip>
+# iPhone (Termius/Blink Shell)
+ssh user@<tailscale-ip>
 tmux attach -t claude
 ```
 
-Done. Both screens are now synced.
+See `tmux.conf` for mobile-optimized config.
 
-## Troubleshooting
+---
 
-### "sessions should be nested with care"
+## Network Setup (Tailscale)
 
-Your SSH client is auto-starting tmux. Either disable that in Termius settings, or:
+Both approaches need your Mac and iPhone on the same network:
 
-```bash
-unset TMUX && tmux attach -t claude
-```
-
-### Chinese / Unicode not displaying
-
-In Termius: Settings → Terminal → change font to one with CJK support (e.g., Menlo, PingFang). Ensure encoding is UTF-8.
-
-### Connection drops when iPhone locks
-
-This is iOS killing background apps. The tmux session on Mac stays alive — just reconnect and `tmux attach -t claude` again. Using Blink Shell with mosh can help maintain connections.
-
-## Optional: Push Notifications
-
-Get notified on iPhone when Claude Code is waiting for your input.
-
-1. Install [Bark](https://apps.apple.com/app/bark/id1403753865) on iPhone
-2. Edit `notify-waiting.sh` — fill in your Bark device key
-3. Run in a separate terminal: `./notify-waiting.sh`
+1. Install [Tailscale](https://tailscale.com/download) on Mac + iPhone
+2. Login with same account
+3. Get Mac IP: `tailscale ip -4`
 
 ## Files
 
-| File | Description |
-|------|-------------|
-| `tmux.conf` | tmux config optimized for mobile (mouse support, Ctrl-a prefix, clean status bar) |
-| `start-claude.sh` | Helper to create/attach claude tmux session |
-| `notify-waiting.sh` | Optional push notification when Claude awaits input |
-
-## Uninstall
-
-```bash
-brew uninstall tmux
-rm ~/.tmux.conf
-# Remove Tailscale from Applications
-# Remove Termius/Blink from iPhone
 ```
+├── claude-mobile/          # Chat UI approach
+│   ├── server.ts           # MCP server + HTTP + WebSocket
+│   ├── auth.ts             # Token authentication
+│   ├── db.ts               # SQLite message persistence
+│   ├── ui.ts               # Chat UI (HTML/CSS/JS)
+│   └── package.json
+├── tmux.conf               # tmux config (fallback approach)
+├── start-claude.sh         # tmux helper script
+└── notify-waiting.sh       # Push notification script (Bark)
+```
+
+## Security
+
+- Token auth prevents unauthorized access
+- Tailscale provides encrypted tunnel (WireGuard)
+- Server only accessible via Tailscale network (not public internet)
+- No data leaves your devices
 
 ## License
 

@@ -1,0 +1,47 @@
+import { Database } from 'bun:sqlite'
+import { mkdirSync } from 'fs'
+import { join } from 'path'
+import { homedir } from 'os'
+
+export type Message = {
+  id: string
+  from: 'user' | 'assistant'
+  text: string
+  ts: number
+  replyTo?: string
+}
+
+const DB_DIR = join(homedir(), '.claude', 'channels', 'claude-mobile')
+mkdirSync(DB_DIR, { recursive: true })
+
+const db = new Database(join(DB_DIR, 'messages.db'))
+db.run('PRAGMA journal_mode = WAL')
+db.run(`CREATE TABLE IF NOT EXISTS messages (
+  id TEXT PRIMARY KEY,
+  "from" TEXT NOT NULL,
+  text TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  reply_to TEXT
+)`)
+
+const insertStmt = db.prepare(
+  `INSERT OR REPLACE INTO messages (id, "from", text, ts, reply_to) VALUES (?, ?, ?, ?, ?)`
+)
+const historyStmt = db.prepare(
+  `SELECT id, "from", text, ts, reply_to FROM messages ORDER BY ts DESC LIMIT ?`
+)
+
+export function saveMessage(msg: Message): void {
+  insertStmt.run(msg.id, msg.from, msg.text, msg.ts, msg.replyTo ?? null)
+}
+
+export function getHistory(limit = 100): Message[] {
+  const rows = historyStmt.all(limit) as any[]
+  return rows.reverse().map(r => ({
+    id: r.id,
+    from: r.from,
+    text: r.text,
+    ts: r.ts,
+    replyTo: r.reply_to ?? undefined,
+  }))
+}
