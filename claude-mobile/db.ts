@@ -9,6 +9,7 @@ export type Message = {
   text: string
   ts: number
   replyTo?: string
+  sessionId?: string
 }
 
 const DB_DIR = join(homedir(), '.claude', 'channels', 'claude-mobile')
@@ -21,27 +22,32 @@ db.run(`CREATE TABLE IF NOT EXISTS messages (
   "from" TEXT NOT NULL,
   text TEXT NOT NULL,
   ts INTEGER NOT NULL,
-  reply_to TEXT
+  reply_to TEXT,
+  session_id TEXT DEFAULT 'default'
 )`)
 
+// Migration: add session_id column if missing
+try { db.run(`ALTER TABLE messages ADD COLUMN session_id TEXT DEFAULT 'default'`) } catch {}
+
 const insertStmt = db.prepare(
-  `INSERT OR REPLACE INTO messages (id, "from", text, ts, reply_to) VALUES (?, ?, ?, ?, ?)`
+  `INSERT OR REPLACE INTO messages (id, "from", text, ts, reply_to, session_id) VALUES (?, ?, ?, ?, ?, ?)`
 )
 const historyStmt = db.prepare(
-  `SELECT id, "from", text, ts, reply_to FROM messages ORDER BY ts DESC LIMIT ?`
+  `SELECT id, "from", text, ts, reply_to, session_id FROM messages WHERE session_id = ? ORDER BY ts DESC LIMIT ?`
 )
 
 export function saveMessage(msg: Message): void {
-  insertStmt.run(msg.id, msg.from, msg.text, msg.ts, msg.replyTo ?? null)
+  insertStmt.run(msg.id, msg.from, msg.text, msg.ts, msg.replyTo ?? null, msg.sessionId ?? 'default')
 }
 
-export function getHistory(limit = 100): Message[] {
-  const rows = historyStmt.all(limit) as any[]
+export function getHistory(sessionId: string, limit = 100): Message[] {
+  const rows = historyStmt.all(sessionId, limit) as any[]
   return rows.reverse().map(r => ({
     id: r.id,
     from: r.from,
     text: r.text,
     ts: r.ts,
     replyTo: r.reply_to ?? undefined,
+    sessionId: r.session_id,
   }))
 }

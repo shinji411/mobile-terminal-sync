@@ -1,0 +1,12 @@
+{
+  "name": "claude-mobile",
+  "description": "Mobile-optimized chat UI for Claude Code — access from iPhone via Tailscale with markdown rendering and code highlighting.",
+  "version": "0.1.0",
+  "keywords": [
+    "mobile",
+    "chat",
+    "channel",
+    "mcp",
+    "iphone"
+  ]
+}
