@@ -368,8 +368,7 @@ body {
 }
 #files-panel { display: none; flex: 1; overflow-y: auto; }
 #files-panel.active { display: flex; flex-direction: column; }
-#resume-panel { display: none; flex: 1; overflow-y: auto; padding: 8px; }
-#resume-panel.active { display: block; }
+#session-list { flex: 1; overflow-y: auto; padding: 8px; display: none; }
 #session-list.active { display: block; }
 
 /* File browser */
@@ -477,12 +476,10 @@ body {
     <button id="new-chat-btn" onclick="newSession()">+ New</button>
   </div>
   <div id="sidebar-tabs">
-    <button class="sidebar-tab active" onclick="switchTab('sessions')">Sessions</button>
-    <button class="sidebar-tab" onclick="switchTab('resume')">Resume</button>
+    <button class="sidebar-tab active" onclick="switchTab('chats')">Chats</button>
     <button class="sidebar-tab" onclick="switchTab('files')">Files</button>
   </div>
   <div id="session-list" class="active"></div>
-  <div id="resume-panel"></div>
   <div id="files-panel">
     <div id="file-breadcrumb"></div>
     <div id="file-entries"></div>
@@ -585,20 +582,78 @@ function toggleSidebar() {
 async function loadSessions() {
   const res = await fetch('/api/sessions')
   sessions = await res.json()
-  renderSessions()
+  renderChatsList()
 }
 
-function renderSessions() {
-  sessionList.innerHTML = sessions.map(s => {
-    const active = s.id === currentSessionId ? ' active' : ''
-    const time = new Date(s.lastActiveAt).toLocaleDateString()
-    return '<div class="session-item' + active + '" onclick="switchSession(\\'' + s.id + '\\')">' +
-      '<span class="name">' + escapeHtml(s.name) + '</span>' +
-      '<span class="time">' + time + '</span>' +
-      '<button class="delete-btn" onclick="event.stopPropagation();renameSessionUI(\\'' + s.id + '\\')" style="font-size:12px">✎</button>' +
-      '<button class="delete-btn" onclick="event.stopPropagation();deleteSessionUI(\\'' + s.id + '\\')">&times;</button>' +
+let macSessions = []
+
+async function renderChatsList() {
+  // Render local sessions first
+  let html = ''
+  if (sessions.length > 0) {
+    html += '<div style="padding:6px 8px;font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px">Active</div>'
+    html += sessions.map(s => {
+      const active = s.id === currentSessionId ? ' active' : ''
+      const time = new Date(s.lastActiveAt).toLocaleDateString()
+      return '<div class="session-item' + active + '" onclick="switchSession(\\'' + s.id + '\\')">' +
+        '<span class="name">' + escapeHtml(s.name) + '</span>' +
+        '<span class="time">' + time + '</span>' +
+        '<button class="delete-btn" onclick="event.stopPropagation();renameSessionUI(\\'' + s.id + '\\')" style="font-size:12px">✎</button>' +
+        '<button class="delete-btn" onclick="event.stopPropagation();deleteSessionUI(\\'' + s.id + '\\')">&times;</button>' +
+        '</div>'
+    }).join('')
+  }
+
+  // Load and render Mac sessions
+  html += '<div style="padding:6px 8px;margin-top:8px;font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px">Mac Sessions (tap to resume)</div>'
+  sessionList.innerHTML = html + '<div style="padding:12px;color:var(--text-muted);font-size:12px">Loading...</div>'
+
+  try {
+    const res = await fetch('/api/claude-sessions')
+    macSessions = await res.json()
+  } catch { macSessions = [] }
+
+  html += macSessions.map(s => {
+    const preview = s.firstMessage || '(empty)'
+    const time = timeAgo(s.startedAt)
+    return '<div class="session-item" style="flex-direction:column;align-items:flex-start;gap:2px;padding:10px 12px" onclick="quickResume(\\'' + s.sessionId + '\\', \\'' + escapeHtml(preview).replace(/'/g, '') + '\\')">' +
+      '<div style="display:flex;width:100%;justify-content:space-between;align-items:center">' +
+        '<span style="font-size:12px;color:var(--text-muted)">' + s.messageCount + ' msgs · ' + time + '</span>' +
+      '</div>' +
+      '<div style="font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%">' + escapeHtml(preview) + '</div>' +
       '</div>'
   }).join('')
+
+  sessionList.innerHTML = html
+}
+
+function timeAgo(ts) {
+  const diff = Date.now() - ts
+  const mins = Math.floor(diff / 60000)
+  if (mins < 60) return mins + 'm ago'
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return hours + 'h ago'
+  const days = Math.floor(hours / 24)
+  return days + 'd ago'
+}
+
+async function quickResume(claudeSessionId, preview) {
+  const name = preview.slice(0, 40) || 'Resumed session'
+  const res = await fetch('/api/sessions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name })
+  })
+  const session = await res.json()
+  await fetch('/api/sessions/' + session.id, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ claudeSessionId })
+  })
+  session.claudeSessionId = claudeSessionId
+  sessions.unshift(session)
+  switchSession(session.id)
+  toggleSidebar()
 }
 
 async function renameSessionUI(id) {
@@ -612,7 +667,7 @@ async function renameSessionUI(id) {
     body: JSON.stringify({ name })
   })
   session.name = name
-  renderSessions()
+  renderChatsList()
   if (id === currentSessionId) title.textContent = name
 }
 
@@ -636,7 +691,7 @@ async function deleteSessionUI(id) {
     title.textContent = 'Claude Code'
     emptyState.style.display = 'flex'
   }
-  renderSessions()
+  renderChatsList()
 }
 
 function switchSession(id) {
@@ -645,7 +700,7 @@ function switchSession(id) {
   if (session) title.textContent = session.name
   emptyState.style.display = 'none'
   clearMessages()
-  renderSessions()
+  renderChatsList()
   if (ws && ws.readyState === 1) {
     ws.send(JSON.stringify({ type: 'switch_session', sessionId: id }))
   }
@@ -832,105 +887,12 @@ async function saveSettings() {
 
 function switchTab(tab) {
   document.querySelectorAll('.sidebar-tab').forEach(t => t.classList.remove('active'))
-  const idx = tab === 'sessions' ? 1 : tab === 'resume' ? 2 : 3
+  const idx = tab === 'chats' ? 1 : 2
   document.querySelector('.sidebar-tab:nth-child(' + idx + ')').classList.add('active')
-  document.getElementById('session-list').classList.toggle('active', tab === 'sessions')
-  document.getElementById('resume-panel').classList.toggle('active', tab === 'resume')
+  document.getElementById('session-list').classList.toggle('active', tab === 'chats')
   document.getElementById('files-panel').classList.toggle('active', tab === 'files')
   if (tab === 'files') loadFiles('')
-  if (tab === 'resume') loadClaudeSessions()
-}
-
-// --- Resume Mac Sessions ---
-
-const resumePanel = document.getElementById('resume-panel')
-
-async function loadClaudeSessions() {
-  resumePanel.innerHTML = '<div style="padding:16px;color:var(--text-muted)">Loading...</div>'
-  const res = await fetch('/api/claude-sessions')
-  const claudeSessions = await res.json()
-  if (!claudeSessions.length) {
-    resumePanel.innerHTML = '<div style="padding:16px;color:var(--text-muted)">No recent sessions found</div>'
-    return
-  }
-  resumePanel.innerHTML = claudeSessions.map(s => {
-    const time = new Date(s.startedAt).toLocaleString()
-    const dir = s.cwd.replace(/^\\/Users\\/[^/]+/, '~')
-    const preview = s.firstMessage || '(no message)'
-    return '<div class="session-item" style="flex-direction:column;align-items:flex-start;gap:4px" onclick="showSessionContext(\\'' + s.sessionId + '\\')">' +
-      '<div style="display:flex;width:100%;justify-content:space-between;align-items:center">' +
-        '<span class="name" style="font-size:13px;color:var(--text-muted)">' + dir + '</span>' +
-        '<span class="time">' + s.messageCount + ' msgs</span>' +
-      '</div>' +
-      '<div style="font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%">' + escapeHtml(preview) + '</div>' +
-      '<div style="font-size:11px;color:var(--text-muted)">' + time + '</div>' +
-      '</div>'
-  }).join('')
-}
-
-let previewSessionId = null
-
-async function showSessionContext(sessionId) {
-  previewSessionId = sessionId
-  resumePanel.innerHTML = '<div style="padding:16px;color:var(--text-muted)">Loading context...</div>'
-  const res = await fetch('/api/claude-sessions/context?id=' + sessionId)
-  const data = await res.json()
-
-  let html = '<div style="padding:8px">'
-  html += '<button onclick="loadClaudeSessions()" style="background:none;border:none;color:var(--user-bubble);font-size:14px;cursor:pointer;margin-bottom:12px">← Back</button>'
-  html += '<div style="display:flex;gap:8px;margin-bottom:12px">'
-  html += '<button onclick="resumeClaudeSession(\\'' + sessionId + '\\')" style="flex:1;padding:10px;border-radius:10px;border:none;background:var(--user-bubble);color:#fff;font-size:14px;cursor:pointer">Resume</button>'
-  html += '<button onclick="getRecap(\\'' + sessionId + '\\')" id="recap-btn" style="flex:1;padding:10px;border-radius:10px;border:1px solid var(--user-bubble);background:none;color:var(--user-bubble);font-size:14px;cursor:pointer">Recap</button>'
-  html += '</div>'
-  html += '<div id="recap-result" style="display:none;padding:10px;margin-bottom:12px;border-radius:10px;background:var(--assistant-bubble);font-size:13px;line-height:1.5"></div>'
-  html += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Recent messages (' + data.messages.length + '):</div>'
-  html += '<div style="max-height:60vh;overflow-y:auto">'
-
-  for (const m of data.messages) {
-    const isUser = m.role === 'user'
-    html += '<div style="padding:8px 10px;margin:4px 0;border-radius:12px;font-size:13px;line-height:1.4;word-break:break-word;' +
-      (isUser ? 'background:var(--user-bubble);color:#fff;margin-left:20%' : 'background:var(--assistant-bubble);color:var(--assistant-text);margin-right:20%') +
-      '">' + escapeHtml(m.text) + '</div>'
-  }
-  html += '</div></div>'
-  resumePanel.innerHTML = html
-}
-
-async function getRecap(sessionId) {
-  const btn = document.getElementById('recap-btn')
-  const result = document.getElementById('recap-result')
-  btn.textContent = 'Loading...'
-  btn.disabled = true
-  try {
-    const res = await fetch('/api/claude-sessions/recap?id=' + sessionId)
-    const data = await res.json()
-    result.textContent = data.recap
-    result.style.display = 'block'
-  } catch {
-    result.textContent = 'Failed to get recap'
-    result.style.display = 'block'
-  }
-  btn.textContent = 'Recap'
-  btn.disabled = false
-}
-
-async function resumeClaudeSession(claudeSessionId) {
-  const name = 'Resumed ' + new Date().toLocaleTimeString()
-  const res = await fetch('/api/sessions', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name })
-  })
-  const session = await res.json()
-  await fetch('/api/sessions/' + session.id, {
-    method: 'PATCH',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ claudeSessionId })
-  })
-  session.claudeSessionId = claudeSessionId
-  sessions.unshift(session)
-  switchSession(session.id)
-  toggleSidebar()
+  if (tab === 'chats') renderChatsList()
 }
 
 // --- File Browser ---
