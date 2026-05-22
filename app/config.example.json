@@ -1,0 +1,11 @@
+{
+  "port": 3210,
+  "host": "0.0.0.0",
+  "workDir": "~/workspace",
+  "defaultModel": "opus",
+  "defaultPermissionMode": "auto",
+  "maxHistoryMessages": 100,
+  "maxFileSize": 524288,
+  "hiddenFiles": [".git", "node_modules", ".DS_Store", ".env"],
+  "tailscaleIp": ""
+}
