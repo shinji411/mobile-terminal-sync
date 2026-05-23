@@ -72,7 +72,7 @@ Edit `app/config.json`:
 ```json
 {
   "port": 3210,
-  "host": "0.0.0.0",
+  "host": "100.x.x.x",
   "workDir": "~/workspace",
   "defaultModel": "opus",
   "defaultPermissionMode": "auto",
@@ -86,14 +86,14 @@ Edit `app/config.json`:
 | Field | Description |
 |-------|-------------|
 | `port` | Server port |
-| `host` | Bind address (`0.0.0.0` for all interfaces) |
+| `host` | Bind address (use your Mac's Tailscale IP, not `0.0.0.0`) |
 | `workDir` | Claude Code working directory (`~` supported) |
 | `defaultModel` | Default model for new sessions |
 | `defaultPermissionMode` | Default permission mode |
 | `maxHistoryMessages` | Max messages loaded per session |
 | `maxFileSize` | Max file size for file viewer (bytes) |
 | `hiddenFiles` | Files/dirs hidden in file browser |
-| `tailscaleIp` | Your Mac's Tailscale IP (shown in startup log) |
+| `tailscaleIp` | Your Mac's Tailscale IP (get it with `tailscale ip -4`) |
 
 ### 4. Run
 
@@ -108,6 +108,7 @@ Edit `app/config.json`:
 ./run.sh stop      # Stop daemon
 ./run.sh status    # Check if running
 ./run.sh log       # View daemon logs
+./run.sh rotate    # Rotate token and restart
 ```
 
 ### 5. Connect
@@ -169,7 +170,7 @@ Override config.json values:
 
 ```bash
 POCKET_CLAUDE_PORT=3210
-POCKET_CLAUDE_HOST=0.0.0.0
+POCKET_CLAUDE_HOST=100.x.x.x
 POCKET_CLAUDE_CWD=/path/to/workspace
 ```
 
