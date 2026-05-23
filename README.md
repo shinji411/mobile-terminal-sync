@@ -175,11 +175,52 @@ POCKET_CLAUDE_CWD=/path/to/workspace
 
 ## Security
 
-- Token auth prevents unauthorized access
-- Tailscale provides WireGuard-encrypted tunnel
-- Server only accessible via Tailscale network
-- `config.json` is gitignored (contains your IP)
-- No data leaves your devices
+Three-layer defense in depth:
+
+1. **Network isolation (Tailscale ACL)** — restrict which devices can reach the server port
+2. **Host binding** — server listens only on Tailscale interface, invisible to LAN/internet
+3. **Token auth** — 24-byte random token required on every connection
+
+All traffic is WireGuard-encrypted end-to-end. No data leaves your devices.
+
+### Recommended Setup
+
+1. **Bind to Tailscale IP** (not `0.0.0.0`):
+
+```json
+{
+  "host": "100.x.x.x"
+}
+```
+
+2. **Configure Tailscale ACL** — only allow your iPhone to access the server port. In [Tailscale Admin → ACLs](https://login.tailscale.com/admin/acls):
+
+```jsonc
+{
+  "grants": [
+    {"src": ["<your-iphone-tailscale-ip>"], "dst": ["<your-mac-tailscale-ip>"], "ip": ["*:3210"]}
+  ]
+}
+```
+
+Get your device IPs with `tailscale status`.
+
+3. **Rotate token** when needed:
+
+```bash
+./run.sh rotate
+```
+
+Stops the server, generates a new token, restarts, and prints the new URL. Open it on iPhone to reconnect.
+
+### Threat Model
+
+An attacker would need to simultaneously:
+- Join your Tailscale tailnet (requires your account credentials)
+- Pass the ACL check (requires your iPhone's Tailscale IP)
+- Know the auth token (stored only locally)
+
+Knowing the port number (3210) alone is not a risk — without Tailscale access, the port is unreachable.
 
 ## License
 

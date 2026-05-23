@@ -6,10 +6,13 @@
 #   ./run.sh stop     停止后台进程
 #   ./run.sh status   查看运行状态
 #   ./run.sh log      查看后台日志
+#   ./run.sh rotate   轮换 token 并重启
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PID_FILE="$HOME/.claude/channels/pocket-claude/server.pid"
-LOG_FILE="$HOME/.claude/channels/pocket-claude/server.log"
+DATA_DIR="$HOME/.claude/channels/pocket-claude"
+PID_FILE="$DATA_DIR/server.pid"
+LOG_FILE="$DATA_DIR/server.log"
+TOKEN_FILE="$DATA_DIR/token"
 WORK_DIR="${POCKET_CLAUDE_CWD:-$HOME/workspace}"
 
 export BUN_INSTALL="$HOME/.bun"
@@ -47,6 +50,34 @@ case "${1:-}" in
       tail -50 "$LOG_FILE"
     else
       echo "No log file found"
+    fi
+    ;;
+
+  rotate)
+    echo "Rotating token..."
+    # Stop if running
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+      kill "$(cat "$PID_FILE")"
+      rm -f "$PID_FILE"
+      sleep 1
+    fi
+    # Delete old token
+    rm -f "$TOKEN_FILE"
+    # Restart in daemon mode
+    cd "$SCRIPT_DIR/app"
+    nohup bun run server.ts > "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    sleep 2
+    if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+      echo "Restarted with new token."
+      echo ""
+      grep "URL:" "$LOG_FILE" | tail -1
+      echo ""
+      echo "Open this URL on iPhone to reconnect."
+    else
+      echo "Failed to restart. Check log:"
+      cat "$LOG_FILE"
+      exit 1
     fi
     ;;
 
