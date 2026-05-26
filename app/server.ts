@@ -7,9 +7,9 @@
  */
 
 import { spawn } from 'bun'
-import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, statSync, watch } from 'fs'
+import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, statSync, watch, realpathSync } from 'fs'
 import { homedir } from 'os'
-import { join, relative, extname } from 'path'
+import { join, relative, extname, resolve } from 'path'
 import type { ServerWebSocket } from 'bun'
 
 import { getOrCreateToken, validateToken } from './auth'
@@ -24,6 +24,7 @@ const HOST = process.env.POCKET_CLAUDE_HOST ?? config.host
 const WORK_DIR = process.env.POCKET_CLAUDE_CWD ?? config.workDir
 const TOKEN = getOrCreateToken()
 const CLAUDE_SESSIONS_DIR = join(homedir(), '.claude', 'sessions')
+const WORK_DIR_REAL = realpathSync(WORK_DIR)
 
 type ClientData = { authed: boolean; sessionId: string | null }
 const clients = new Set<ServerWebSocket<ClientData>>()
@@ -97,6 +98,42 @@ function getSessionState(sessionId: string): SessionState {
 
 function nextId() {
   return `a${Date.now()}-${++seq}`
+}
+
+function isAuthorized(req: Request, url: URL): boolean {
+  const auth = req.headers.get('authorization') || ''
+  const bearer = auth.match(/^Bearer\s+(.+)$/i)?.[1]
+  return bearer === TOKEN || validateToken(url, TOKEN)
+}
+
+function sanitizeSessionUpdates(body: Partial<Session>): Partial<Session> {
+  const updates: Partial<Session> = {}
+  if (typeof body.name === 'string') {
+    updates.name = body.name.trim().slice(0, 120) || 'Untitled'
+  }
+  if (typeof body.model === 'string' && ['opus', 'sonnet', 'haiku'].includes(body.model)) {
+    updates.model = body.model
+  }
+  if (typeof body.permissionMode === 'string' && ['auto', 'bypassPermissions', 'plan', 'default'].includes(body.permissionMode)) {
+    updates.permissionMode = body.permissionMode
+  }
+  if (typeof body.claudeSessionId === 'string' && /^[A-Za-z0-9_-]+$/.test(body.claudeSessionId)) {
+    updates.claudeSessionId = body.claudeSessionId
+  }
+  return updates
+}
+
+function scopedPath(reqPath: string): string | null {
+  if (!reqPath || reqPath.startsWith('/')) reqPath = '.'
+  const resolved = resolve(WORK_DIR_REAL, reqPath)
+  if (!resolved.startsWith(WORK_DIR_REAL)) return null
+  try {
+    const real = realpathSync(resolved)
+    if (!real.startsWith(WORK_DIR_REAL)) return null
+    return real
+  } catch {
+    return resolved
+  }
 }
 
 function broadcastToSession(sessionId: string, data: object) {
@@ -400,6 +437,10 @@ Bun.serve({
     const json = (data: any, status = 200) =>
       new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } })
 
+    if (url.pathname.startsWith('/api/') && !isAuthorized(req, url)) {
+      return json({ error: 'unauthorized' }, 401)
+    }
+
     if (url.pathname === '/api/sessions' && req.method === 'GET') {
       return json(listSessions())
     }
@@ -417,14 +458,15 @@ Bun.serve({
       return (async () => {
         const id = url.pathname.split('/')[3]
         const body = await req.json() as Partial<Session> & { claudeSessionId?: string }
-        const session = updateSession(id, body)
+        const updates = sanitizeSessionUpdates(body)
+        const session = updateSession(id, updates)
         if (!session) return json({ error: 'not found' }, 404)
 
         // If setting claudeSessionId (resume), load history from JSONL
-        if (body.claudeSessionId) {
+        if (updates.claudeSessionId) {
           const projectDirs = readdirSync(join(homedir(), '.claude', 'projects')).filter(d => !d.startsWith('.'))
           for (const pd of projectDirs) {
-            const jsonlPath = join(homedir(), '.claude', 'projects', pd, body.claudeSessionId + '.jsonl')
+            const jsonlPath = join(homedir(), '.claude', 'projects', pd, updates.claudeSessionId + '.jsonl')
             if (existsSync(jsonlPath)) {
               const content = readFileSync(jsonlPath, 'utf-8')
               const lines = content.split('\n').filter(l => l.trim())
@@ -437,7 +479,7 @@ Bun.serve({
                     if (typeof c === 'string' && !c.startsWith('<')) {
                       msgSeq++
                       const msg: Message = {
-                        id: `hist-u-${msgSeq}`,
+                        id: `${id}-hist-u-${msgSeq}`,
                         from: 'user',
                         text: c,
                         ts: entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now() - (10000 - msgSeq),
@@ -452,7 +494,7 @@ Bun.serve({
                       if (t) {
                         msgSeq++
                         const msg: Message = {
-                          id: `hist-a-${msgSeq}`,
+                          id: `${id}-hist-a-${msgSeq}`,
                           from: 'assistant',
                           text: t,
                           ts: entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now() - (10000 - msgSeq),
@@ -620,9 +662,8 @@ Bun.serve({
     // --- File Browser API ---
     if (url.pathname === '/api/files') {
       const reqPath = url.searchParams.get('path') || ''
-      const fullPath = join(WORK_DIR, reqPath)
-      // Prevent path traversal
-      if (!fullPath.startsWith(WORK_DIR)) return json({ error: 'forbidden' }, 403)
+      const fullPath = scopedPath(reqPath)
+      if (!fullPath) return json({ error: 'forbidden' }, 403)
       try {
         const stat = statSync(fullPath)
         if (stat.isDirectory()) {
@@ -720,7 +761,7 @@ Bun.serve({
                 const c = entry.message.content
                 if (typeof c === 'string' && !c.startsWith('<')) {
                   msgSeq++
-                  messages.push({ id: `reload-u-${msgSeq}`, from: 'user', text: c, ts: entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now(), sessionId })
+                  messages.push({ id: `${sessionId}-reload-u-${msgSeq}`, from: 'user', text: c, ts: entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now(), sessionId })
                 }
               } else if (entry.type === 'assistant') {
                 const blocks = entry.message?.content
@@ -728,7 +769,7 @@ Bun.serve({
                   const t = parseAssistantBlocks(blocks)
                   if (t) {
                     msgSeq++
-                    messages.push({ id: `reload-a-${msgSeq}`, from: 'assistant', text: t, ts: entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now(), sessionId })
+                    messages.push({ id: `${sessionId}-reload-a-${msgSeq}`, from: 'assistant', text: t, ts: entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now(), sessionId })
                   }
                 }
               }

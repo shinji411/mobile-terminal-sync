@@ -648,6 +648,7 @@ body.select-mode #input-area { display: none; }
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" media="(prefers-color-scheme: dark)">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" media="(prefers-color-scheme: light)">
@@ -685,6 +686,12 @@ let sessions = []
 let isThinking = false
 let userAtBottom = true
 
+function apiFetch(url, options = {}) {
+  const headers = Object.assign({}, options.headers || {})
+  if (token) headers.authorization = 'Bearer ' + token
+  return fetch(url, Object.assign({}, options, { headers }))
+}
+
 function toggleSidebar() {
   sidebar.classList.toggle('open')
   overlay.classList.toggle('show')
@@ -693,7 +700,7 @@ function toggleSidebar() {
 // --- Session Management ---
 
 async function loadSessions() {
-  const res = await fetch('/api/sessions')
+  const res = await apiFetch('/api/sessions')
   sessions = await res.json()
   renderChatsList()
 }
@@ -727,7 +734,7 @@ async function renderChatsList() {
   sessionList.innerHTML = html + '<div style="padding:12px;color:var(--text-muted);font-size:12px">Loading...</div>'
 
   try {
-    const res = await fetch('/api/claude-sessions')
+    const res = await apiFetch('/api/claude-sessions')
     macSessions = await res.json()
   } catch { macSessions = [] }
 
@@ -766,13 +773,13 @@ function timeAgo(ts) {
 
 async function quickResume(claudeSessionId, preview) {
   const name = preview.slice(0, 40) || 'Resumed session'
-  const res = await fetch('/api/sessions', {
+  const res = await apiFetch('/api/sessions', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ name })
   })
   const session = await res.json()
-  await fetch('/api/sessions/' + session.id, {
+  await apiFetch('/api/sessions/' + session.id, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ claudeSessionId })
@@ -851,7 +858,7 @@ async function renameSessionUI(id) {
   if (!session) return
   const name = prompt('Rename session:', session.name)
   if (!name || name === session.name) return
-  await fetch('/api/sessions/' + id, {
+  await apiFetch('/api/sessions/' + id, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ name })
@@ -869,7 +876,7 @@ function renameFromTitle() {
 async function newSession() {
   const name = prompt('Session name:', 'Chat ' + new Date().toLocaleTimeString())
   if (!name) return
-  const res = await fetch('/api/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }) })
+  const res = await apiFetch('/api/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }) })
   const session = await res.json()
   sessions.unshift(session)
   switchSession(session.id)
@@ -878,7 +885,7 @@ async function newSession() {
 
 async function deleteSessionUI(id) {
   if (!confirm('Delete this session?')) return
-  await fetch('/api/sessions/' + id, { method: 'DELETE' })
+  await apiFetch('/api/sessions/' + id, { method: 'DELETE' })
   sessions = sessions.filter(s => s.id !== id)
   if (currentSessionId === id) {
     currentSessionId = null
@@ -988,7 +995,7 @@ function showUpdateBanner() {
 
 function render(text) {
   try {
-    let html = marked.parse(text)
+    let html = DOMPurify.sanitize(marked.parse(text))
     // Add copy button to code blocks
     html = html.replace(/<pre><code(.*?)>/g, '<div class="code-block-wrapper"><button class="copy-code-btn" onclick="copyCodeBlock(this)">Copy</button><pre><code$1>')
     html = html.replace(/<\\/code><\\/pre>/g, '</code></pre></div>')
@@ -1263,7 +1270,7 @@ async function saveSettings() {
   if (!currentSessionId) return
   const model = document.getElementById('model-select').value
   const permissionMode = document.getElementById('mode-select').value
-  await fetch('/api/sessions/' + currentSessionId, {
+  await apiFetch('/api/sessions/' + currentSessionId, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model, permissionMode })
@@ -1330,7 +1337,7 @@ function formatSize(bytes) {
 async function loadFiles(path) {
   currentFilePath = path
   try {
-    const res = await fetch('/api/files?path=' + encodeURIComponent(path))
+    const res = await apiFetch('/api/files?path=' + encodeURIComponent(path))
     const data = await res.json()
     if (data.error) { fileEntries.innerHTML = '<div style="padding:16px;color:var(--text-muted)">' + data.error + '</div>'; return }
     if (data.type === 'dir') {
