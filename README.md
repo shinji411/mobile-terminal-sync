@@ -119,6 +119,50 @@ Open in browser:
 
 Token is auto-generated on first run and printed in the startup log.
 
+## Windows
+
+On Windows the server runs under [Git Bash](https://git-scm.com/download/win). Use the bundled launcher scripts instead of `run.sh`.
+
+### 1. Configure your local environment
+
+Machine-specific values (bun path, working directory, AWS profile, etc.) live in `env.local.sh`, which is **gitignored** so your private paths and account IDs never get committed. Create it from the template:
+
+```bash
+cp env.example.sh env.local.sh
+# Edit env.local.sh — fill in the values you need (every field is optional;
+# the scripts fall back to sensible defaults for anything left blank).
+```
+
+| Variable | Description |
+|----------|-------------|
+| `PC_BUN` | Absolute path to `bun.exe` (defaults to `bun` on your PATH) |
+| `PC_TAILSCALE` | Path to `tailscale.exe` (defaults to `/c/Program Files/Tailscale/tailscale.exe`) |
+| `POCKET_CLAUDE_CWD` | Working directory new sessions start in (defaults to the current dir) |
+| `PC_USE_BEDROCK` | Set to `1` to run Claude Code via AWS Bedrock instead of your default Claude Code auth |
+| `PC_AWS_PROFILE` / `PC_AWS_REGION` | AWS profile/region (only used when `PC_USE_BEDROCK=1`) |
+| `PC_WORK_DIR` | tmux launcher working dir (defaults to `~/workspace`) |
+| `PC_TEST_HOST` | `host:port` the E2E test client connects to (defaults to `127.0.0.1:3210`) |
+
+### 2. Run
+
+```bash
+# Foreground, binds to your Tailscale IP so the phone can reach it
+./start-windows.sh
+
+# Local only (binds 127.0.0.1, for testing on this machine)
+./start-windows.sh local
+
+# Switch model (default is Opus 4.8)
+./start-windows.sh fable
+
+# Rotate the auth token, then start
+./start-windows.sh rotate
+
+# Stop the server (also from PowerShell/CMD: stop-windows.cmd)
+```
+
+Double-clickable wrappers `start-windows.cmd` / `stop-windows.cmd` are provided for launching from Explorer or PowerShell.
+
 ## Prerequisites
 
 - macOS with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed
@@ -159,7 +203,13 @@ Token is auto-generated on first run and printed in the startup log.
 │   ├── sessions.ts        # Session CRUD
 │   ├── ui.ts              # Chat UI (HTML/CSS/JS)
 │   └── package.json
-├── run.sh                 # Launcher script
+├── run.sh                 # Launcher script (macOS/Linux)
+├── start-windows.sh       # Launcher script (Windows / Git Bash)
+├── start-windows.cmd      # Double-clickable wrapper (Windows)
+├── stop-windows.cmd       # Stop the server (Windows)
+├── start-claude.sh        # Helper: launch Claude Code in a tmux session
+├── env.example.sh         # Template for local env vars
+├── env.local.sh           # Your local env vars (gitignored)
 ├── CHANGELOG.md
 └── README.md
 ```
@@ -173,6 +223,8 @@ POCKET_CLAUDE_PORT=3210
 POCKET_CLAUDE_HOST=100.x.x.x
 POCKET_CLAUDE_CWD=/path/to/workspace
 ```
+
+On Windows these (and the `PC_*` launcher variables) are set in `env.local.sh` — see [Windows](#windows).
 
 ## Security
 

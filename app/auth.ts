@@ -1,4 +1,4 @@
-import { randomBytes } from 'crypto'
+import { randomBytes, timingSafeEqual } from 'crypto'
 import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
@@ -18,5 +18,8 @@ export function getOrCreateToken(): string {
 }
 
 export function validateToken(url: URL, token: string): boolean {
-  return url.searchParams.get('token') === token
+  const given = url.searchParams.get('token') || ''
+  const a = Buffer.from(given)
+  const b = Buffer.from(token)
+  return a.length === b.length && timingSafeEqual(a, b)
 }

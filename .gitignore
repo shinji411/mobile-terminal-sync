@@ -5,3 +5,13 @@
 node_modules/
 bun.lock
 app/config.json
+
+# Logs may contain the access token (startup banner prints the URL)
+*.log
+
+# Machine-specific / private config (AWS profile, paths, Tailscale IP).
+# Copy env.example.sh -> env.local.sh and fill in your own values.
+env.local.sh
+
+# Stray build artifact accidentally written to the Windows device name "nul".
+app/nul

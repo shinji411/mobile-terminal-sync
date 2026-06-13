@@ -2,8 +2,12 @@
 # 启动 Claude Code tmux 会话
 # 用法: ./start-claude.sh [工作目录]
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "$SCRIPT_DIR/env.local.sh" ] && . "$SCRIPT_DIR/env.local.sh"
+
 SESSION_NAME="claude"
-WORK_DIR="${1:-/Users/eric/workspace}"
+# 优先级: 命令行参数 > env.local.sh 的 PC_WORK_DIR > ~/workspace
+WORK_DIR="${1:-${PC_WORK_DIR:-$HOME/workspace}}"
 
 # 如果会话已存在，直接 attach
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then

@@ -10,6 +10,7 @@ export type Session = {
   lastActiveAt: number
   model: string
   permissionMode: string
+  cwd?: string
 }
 
 const SESSIONS_DIR = join(homedir(), '.claude', 'channels', 'pocket-claude', 'sessions')
