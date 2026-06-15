@@ -600,6 +600,100 @@ function createTurnParser(sessionId: string, state: SessionState): TurnParser {
 const MAX_PERSISTENT_PROCS = 3
 const PERSISTENT_IDLE_MS = 15 * 60 * 1000
 
+// --- Interactive dialogs / approvals (control_request protocol) ---
+// claude (2.1.x) speaks a bidirectional control protocol over the stream-json
+// stdin/stdout channel: it emits `{type:"control_request",request_id,request:
+// {subtype:...}}` and waits for us to write back a matching `control_response`.
+// Two subtypes matter to a phone bridge:
+//   - request_user_dialog (dialog_kind "ask_user_question" | "plan_dialog_choice"
+//     | "refusal_fallback_prompt"): Claude is ASKING the user something (e.g.
+//     the AskUserQuestion multiple-choice tool, or ExitPlanMode confirmation).
+//   - can_use_tool: a tool needs permission (only emitted in non-bypass modes).
+// We forward these to the phone, collect the answer, and write the response
+// back to stdin so the turn continues.
+//
+// CRITICAL fail-closed behavior (confirmed from the CLI binary): the CLI only
+// surfaces a dialog kind we DECLARE support for at init. An undeclared kind
+// "degrades to its no-dialog behavior" — i.e. Claude proceeds WITHOUT the
+// user's answer. That silent degradation is exactly why phone users never saw
+// AskUserQuestion prompts. We declare support via an `initialize` control
+// request right after spawn.
+//
+// Feature-flagged OFF by default until the initialize handshake is verified
+// against the live CLI — a malformed init could destabilize every turn.
+// Enable with POCKET_CLAUDE_DIALOGS=1.
+const DIALOGS_ENABLED = process.env.POCKET_CLAUDE_DIALOGS === '1'
+const SUPPORTED_DIALOG_KINDS = ['ask_user_question', 'plan_dialog_choice', 'refusal_fallback_prompt']
+const DIALOG_TIMEOUT_MS = Number(process.env.POCKET_CLAUDE_DIALOG_TIMEOUT_MS ?? 5 * 60 * 1000)
+
+type PendingDialog = {
+  requestId: string
+  sessionId: string
+  entry: PersistentProc
+  subtype: string
+  timer: ReturnType<typeof setTimeout> | null
+}
+const pendingDialogs = new Map<string, PendingDialog>()
+
+function writeControlResponse(entry: PersistentProc, requestId: string, response: object) {
+  const line = JSON.stringify({
+    type: 'control_response',
+    response: { subtype: 'success', request_id: requestId, response },
+  }) + '\n'
+  try {
+    entry.stdin.write(line)
+    entry.stdin.flush()
+  } catch (e: any) {
+    plog(`control_response write failed for request ${requestId}: ${e?.message || e}`)
+  }
+}
+
+// Resolve a pending dialog (from a phone answer, timeout, or cancel). `response`
+// is the inner result object written back to the CLI, e.g.
+// {behavior:"allow",updatedInput:{...,answers:{...}}} or {behavior:"cancelled"}.
+function resolvePendingDialog(requestId: string, response: object) {
+  const pd = pendingDialogs.get(requestId)
+  if (!pd) return
+  if (pd.timer) clearTimeout(pd.timer)
+  pendingDialogs.delete(requestId)
+  writeControlResponse(pd.entry, requestId, response)
+}
+
+// Handle an inbound control_request emitted on the CLI's stdout. Returns true
+// if it was a dialog/permission request we forwarded (so the stdout loop knows
+// not to treat it as a turn event).
+function handleControlRequest(entry: PersistentProc, data: any): boolean {
+  const requestId = data.request_id
+  const req = data.request || {}
+  const subtype = req.subtype
+  if (!requestId || !subtype) return false
+
+  if (subtype === 'request_user_dialog' || subtype === 'can_use_tool') {
+    const pd: PendingDialog = { requestId, sessionId: entry.sessionId, entry, subtype, timer: null }
+    pd.timer = setTimeout(() => {
+      plog(`dialog ${requestId} (${subtype}) timed out after ${DIALOG_TIMEOUT_MS}ms — auto-cancelling`)
+      resolvePendingDialog(requestId, { behavior: 'cancelled' })
+      broadcastToSession(entry.sessionId, { type: 'approval_cancelled', requestId })
+    }, DIALOG_TIMEOUT_MS)
+    pendingDialogs.set(requestId, pd)
+    // Forward to the phone. The payload differs per subtype; the client renders
+    // whichever fields are present (questions[] for dialogs, tool_name/input
+    // for can_use_tool).
+    broadcastToSession(entry.sessionId, {
+      type: 'approval_request',
+      requestId,
+      subtype,
+      dialogKind: req.dialog_kind || null,
+      toolName: req.tool_name || null,
+      displayName: req.display_name || null,
+      input: req.input ?? null,
+      payload: req.payload ?? null,
+    })
+    return true
+  }
+  return false
+}
+
 type StdinSink = { write(s: string): unknown; flush(): unknown; end(): unknown }
 
 type TurnHooks = {
@@ -773,6 +867,26 @@ function spawnPersistentProc(sessionId: string, session: Session, cwd: string): 
   persistentProcs.set(sessionId, entry)
   plog(`spawned proc for session ${sessionId} (pid=${proc.pid}, resume=${session.claudeSessionId || 'new'}, pool=${persistentProcs.size})`)
 
+  // Declare which interactive dialog kinds we can render, so the CLI surfaces
+  // them as control_request instead of silently degrading to no-dialog
+  // behavior (its fail-closed default). Sent once per process lifetime, right
+  // after spawn. The CLI acks with a control_response (consumed and ignored in
+  // the stdout loop). Feature-flagged until verified against the live CLI.
+  if (DIALOGS_ENABLED) {
+    try {
+      const initLine = JSON.stringify({
+        type: 'control_request',
+        request_id: `pc-init-${nextId()}`,
+        request: { subtype: 'initialize', supportedDialogKinds: SUPPORTED_DIALOG_KINDS },
+      }) + '\n'
+      ;(proc.stdin as unknown as StdinSink).write(initLine)
+      ;(proc.stdin as unknown as StdinSink).flush()
+      plog(`sent initialize handshake for session ${sessionId} (dialogKinds=${SUPPORTED_DIALOG_KINDS.join(',')})`)
+    } catch (e: any) {
+      plog(`initialize handshake write failed for session ${sessionId}: ${e?.message || e}`)
+    }
+  }
+
   // Drain stderr; keep a short tail for crash diagnostics
   ;(async () => {
     try {
@@ -811,6 +925,15 @@ function spawnPersistentProc(sessionId: string, session: Session, cwd: string): 
           try {
             const data = JSON.parse(line.trim())
             entry.sawAnyEvent = true
+            // Intercept the bidirectional control protocol BEFORE turn parsing:
+            // control_request (dialogs / tool permission) is answered out-of-band
+            // and must not be fed to the turn parser as an assistant event.
+            if (DIALOGS_ENABLED && data.type === 'control_request') {
+              if (handleControlRequest(entry, data)) continue
+            }
+            // control_response from the CLI (acks to OUR control requests, e.g.
+            // the initialize handshake) — not a turn event either.
+            if (data.type === 'control_response') continue
             entry.currentTurn?.onEvent(data)
           } catch {}
         }
@@ -826,6 +949,15 @@ function spawnPersistentProc(sessionId: string, session: Session, cwd: string): 
   proc.exited.then((code) => {
     if (persistentProcs.get(sessionId) === entry) persistentProcs.delete(sessionId)
     if (entry.idleTimer) { clearTimeout(entry.idleTimer); entry.idleTimer = null }
+    // Any dialogs awaiting an answer on this dead process can never be
+    // answered — clear their timers and tell the phone to dismiss them.
+    for (const [rid, pd] of [...pendingDialogs]) {
+      if (pd.entry === entry) {
+        if (pd.timer) clearTimeout(pd.timer)
+        pendingDialogs.delete(rid)
+        broadcastToSession(entry.sessionId, { type: 'approval_cancelled', requestId: rid })
+      }
+    }
     if (!entry.expectedExit) {
       plog(`proc for session ${sessionId} exited unexpectedly (code=${code}, turns=${entry.successfulTurns})` +
         (entry.stderrTail.length ? ` stderr: ${entry.stderrTail.slice(-3).join(' | ')}` : ''))
@@ -1533,6 +1665,14 @@ Bun.serve({
     return new Response('404', { status: 404 })
   },
   websocket: {
+    // Keep-alive (BUG: phone stuck on "reconnecting"). Bun closes a WS after
+    // ~120s of silence by default; a backgrounded iOS PWA stops sending for
+    // far longer, so the socket silently half-dies mid-session and every
+    // turn's delta/status events vanish into a dead connection. The client
+    // pings every 25s; we widen the idle window to 300s so a brief background
+    // blip cannot tear the socket down. We also reply to app-level ping with
+    // pong below so the client can detect a half-open socket and reconnect.
+    idleTimeout: 300,
     open(ws: ServerWebSocket<ClientData>) {
       clients.add(ws)
       if (ws.data.sessionId) {
@@ -1553,6 +1693,39 @@ Bun.serve({
     message(ws, raw) {
       try {
         const data = JSON.parse(String(raw)) as any
+
+        // App-level heartbeat: the client pings every 25s. Replying lets the
+        // client distinguish a live socket from a half-open one (a TCP that
+        // looks open but whose packets never arrive) and reconnect proactively.
+        if (data.type === 'ping') {
+          if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'pong' }))
+          return
+        }
+
+        // Answer to a forwarded dialog / tool-permission request. The phone
+        // (which holds the full request payload) sends
+        //   { requestId, decision: 'allow'|'deny'|'cancel', updatedInput?, message? }
+        // and we wrap it into the CLI's control_response inner shape, writing
+        // it back to the owning persistent process's stdin.
+        //   - allow:     { behavior:'allow', updatedInput:{...} }
+        //                 (for ask_user_question updatedInput carries
+        //                  { ...toolInput, answers:{ [question]: answer } })
+        //   - deny:      { behavior:'deny', message:'...' }
+        //   - cancel:    { behavior:'cancelled' }
+        if (data.type === 'approval_response') {
+          const pd = pendingDialogs.get(data.requestId)
+          if (!pd) return                 // already resolved / timed out / proc died
+          let response: object
+          if (data.decision === 'deny') {
+            response = { behavior: 'deny', message: data.message || 'Denied by user' }
+          } else if (data.decision === 'cancel') {
+            response = { behavior: 'cancelled' }
+          } else {
+            response = { behavior: 'allow', updatedInput: data.updatedInput ?? {} }
+          }
+          resolvePendingDialog(data.requestId, response)
+          return
+        }
 
         // Switch session
         if (data.type === 'switch_session') {

@@ -384,6 +384,52 @@ body {
 .typing span:nth-child(3) { animation-delay: 0.4s; }
 @keyframes bounce { 0%,60%,100% { transform: translateY(0); } 30% { transform: translateY(-4px); } }
 
+/* Interactive dialog / approval card (WS type:'approval_request') — Claude is
+   asking the user something or a tool needs permission. Rendered in-flow. */
+.approval-card {
+  align-self: stretch;
+  max-width: 100%;
+  margin: 4px 0;
+  padding: 14px;
+  border-radius: 14px;
+  background: var(--assistant-bubble);
+  border: 1px solid var(--user-bubble);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  animation: fadeIn 0.2s ease;
+}
+.approval-card.flash { animation: flashErr 0.4s ease; }
+@keyframes flashErr { 0%,100% { border-color: var(--user-bubble); } 50% { border-color: #f85149; } }
+.approval-head { font-weight: 600; font-size: 14px; margin-bottom: 10px; }
+.approval-q { margin-bottom: 12px; }
+.approval-chip {
+  display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+  padding: 2px 8px; border-radius: 8px; background: var(--user-bubble); color: var(--text-muted); margin-bottom: 6px;
+}
+.approval-qtext { font-size: 14px; line-height: 1.4; margin-bottom: 8px; }
+.approval-opt {
+  display: block; width: 100%; text-align: left; margin: 6px 0; padding: 10px 12px;
+  border-radius: 10px; border: 1px solid var(--user-bubble); background: var(--bg);
+  color: var(--text); cursor: pointer; font-size: 13px; line-height: 1.35;
+}
+.approval-opt b { display: block; font-weight: 600; }
+.approval-opt span { display: block; font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.approval-opt.sel { border-color: #2ea043; background: rgba(46,160,67,0.12); }
+.approval-free {
+  width: 100%; margin-top: 6px; padding: 9px 12px; border-radius: 10px;
+  border: 1px solid var(--user-bubble); background: var(--bg); color: var(--text); font-size: 13px;
+}
+.approval-input {
+  font-size: 12px; background: var(--bg); border: 1px solid var(--user-bubble); border-radius: 10px;
+  padding: 10px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin-bottom: 10px;
+}
+.approval-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+.approval-btn {
+  padding: 9px 18px; border-radius: 10px; border: 1px solid var(--user-bubble);
+  background: var(--bg); color: var(--text); cursor: pointer; font-size: 14px; font-weight: 500;
+}
+.approval-btn.primary { background: #2ea043; border-color: #2ea043; color: #fff; }
+.approval-btn.danger { background: rgba(248,81,73,0.12); border-color: rgba(248,81,73,0.4); color: #cf222e; }
+
 /* Transient error notice (WS type:'error') — centered, red, not part of history */
 .error-notice {
   align-self: center;
@@ -1012,24 +1058,92 @@ function clearMessages() {
 }
 
 // --- WebSocket ---
+//
+// Reliability layer (fixes phone "reconnecting" / stale-session / dropped
+// deltas). Three cooperating mechanisms:
+//   1. Heartbeat: ping every PING_MS; if no pong within PONG_TIMEOUT_MS the
+//      socket is half-open (looks OPEN but packets don't flow — common after
+//      an iOS background/lock) so we force-close it, which triggers reconnect.
+//   2. Exponential backoff reconnect (reset on a clean open), with a single
+//      pending timer so overlapping triggers can't spawn a connection storm.
+//   3. Proactive reconnect on regaining focus / network: when the PWA returns
+//      to the foreground we don't wait for the next timer — reconnect now,
+//      which also re-sends history so the conversation is current.
+
+const PING_MS = 25000
+const PONG_TIMEOUT_MS = 60000
+let pingTimer = null
+let reconnectTimer = null
+let reconnectDelay = 1000
+let lastPongAt = 0
+let manualClose = false
+
+function clearTimers() {
+  if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return            // a reconnect is already pending
+  dot.className = 'dot offline'
+  status.textContent = 'reconnecting...'
+  sendBtn.disabled = true
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null
+    connect()
+  }, reconnectDelay)
+  // Back off up to 15s; reset to 1s on the next successful open.
+  reconnectDelay = Math.min(reconnectDelay * 1.8, 15000)
+}
+
+// Force a fresh socket NOW (used by heartbeat-timeout and foreground/online).
+// Tears down the current socket without letting its onclose re-schedule, then
+// reconnects immediately with the backoff reset.
+function reconnectNow() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+  reconnectDelay = 1000
+  clearTimers()
+  if (ws) {
+    try { manualClose = true; ws.onclose = null; ws.onerror = null; ws.close() } catch {}
+  }
+  connect()
+}
+
+function startHeartbeat() {
+  clearTimers()
+  lastPongAt = Date.now()
+  pingTimer = setInterval(() => {
+    if (!ws || ws.readyState !== 1) return
+    // No pong since the last interval window → the socket is half-open.
+    if (Date.now() - lastPongAt > PONG_TIMEOUT_MS) {
+      reconnectNow()
+      return
+    }
+    try { ws.send(JSON.stringify({ type: 'ping' })) } catch { reconnectNow() }
+  }, PING_MS)
+}
 
 function connect() {
+  manualClose = false
   const sessionParam = currentSessionId ? '&session=' + currentSessionId : ''
   ws = new WebSocket(proto + '//' + location.host + '/ws?token=' + token + sessionParam)
   ws.onopen = () => {
     dot.className = 'dot'
     status.textContent = 'connected'
     sendBtn.disabled = !input.value.trim()
+    reconnectDelay = 1000                // clean connection → reset backoff
+    startHeartbeat()
   }
   ws.onclose = () => {
-    dot.className = 'dot offline'
-    status.textContent = 'reconnecting...'
-    sendBtn.disabled = true
-    setTimeout(connect, 2000)
+    if (manualClose) return              // reconnectNow() already handled it
+    clearTimers()
+    scheduleReconnect()
   }
+  ws.onerror = () => { try { ws.close() } catch {} }
   ws.onmessage = e => {
     const data = JSON.parse(e.data)
-    if (data.type === 'history') {
+    if (data.type === 'pong') {
+      lastPongAt = Date.now()
+    } else if (data.type === 'history') {
       clearMessages()
       if (data.messages.length > 0) emptyState.style.display = 'none'
       data.messages.forEach(m => addMessage(m, false))
@@ -1038,14 +1152,11 @@ function connect() {
       emptyState.style.display = 'none'
       addMessage(data, true)
     } else if (data.type === 'delta') {
-      const el = document.querySelector('[data-id="' + data.id + '"] .content')
-      if (el) { el.innerHTML = render(data.text); if (userAtBottom) scrollBottom() }
+      updateBubble(data.id, data.text)
     } else if (data.type === 'complete') {
-      const el = document.querySelector('[data-id="' + data.id + '"] .content')
-      if (el) { el.innerHTML = render(data.text); if (userAtBottom) scrollBottom() }
+      updateBubble(data.id, data.text)
     } else if (data.type === 'edit') {
-      const el = document.querySelector('[data-id="' + data.id + '"] .content')
-      if (el) { el.innerHTML = render(data.text); if (userAtBottom) scrollBottom() }
+      updateBubble(data.id, data.text)
     } else if (data.type === 'status') {
       if (data.status === 'thinking') {
         isThinking = true
@@ -1070,10 +1181,48 @@ function connect() {
     } else if (data.type === 'notice') {
       showNotice(data.text)
     } else if (data.type === 'session_updated') {
-      showUpdateBanner()
+      // Auto-reload (Joe's choice) instead of the manual "tap to reload"
+      // banner: pull the latest messages from the resumed conversation as
+      // soon as activity is detected on another device.
+      if (currentSessionId && ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'reload_session', sessionId: currentSessionId }))
+      }
+    } else if (data.type === 'approval_request') {
+      showApprovalRequest(data)
+    } else if (data.type === 'approval_cancelled') {
+      removeApprovalRequest(data.requestId)
     }
   }
 }
+
+// Update a streaming bubble's content; if the bubble doesn't exist yet (e.g.
+// the msg that created it was lost to a dropped socket and this delta
+// arrived after reconnect), create it so in-flight assistant output is never
+// silently discarded.
+function updateBubble(id, text) {
+  let el = document.querySelector('[data-id="' + id + '"] .content')
+  if (!el) {
+    emptyState.style.display = 'none'
+    addMessage({ id, from: 'assistant', text, ts: Date.now() }, true)
+    el = document.querySelector('[data-id="' + id + '"] .content')
+  }
+  if (el) { el.innerHTML = render(text); if (userAtBottom) scrollBottom() }
+}
+
+// Reconnect proactively when the app returns to the foreground or the network
+// comes back — don't wait out the backoff timer. A backgrounded socket is
+// usually half-open, so we tear it down and rebuild for a clean session.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && (!ws || ws.readyState !== 1)) {
+    reconnectNow()
+  } else if (document.visibilityState === 'visible') {
+    // Socket looks open but may be stale — probe immediately; the heartbeat
+    // timeout will rebuild it if the pong never arrives.
+    try { ws.send(JSON.stringify({ type: 'ping' })) } catch { reconnectNow() }
+  }
+})
+window.addEventListener('online', () => reconnectNow())
+
 connect()
 
 // Transient error notice: shown in chat flow, NOT stored in message history.
@@ -1098,6 +1247,185 @@ function showNotice(text) {
   notice.textContent = '✓ ' + String(text || '')
   messages.insertBefore(notice, typing)
   scrollBottom()
+}
+
+// --- Interactive dialogs / approvals (control_request forwarding) ---
+//
+// The server forwards Claude's interactive requests as approval_request:
+//   - subtype 'request_user_dialog' (dialogKind 'ask_user_question'): Claude is
+//     asking the user a multiple-choice / free-text question. payload.questions
+//     is [{ question, header, options:[{label,description}], multiSelect }].
+//   - subtype 'can_use_tool': a tool needs permission. toolName/displayName/input.
+// We render an in-chat card; the user's answer is sent back as approval_response
+// and the server writes the matching control_response to the CLI.
+
+function removeApprovalRequest(requestId) {
+  const el = document.getElementById('approval-' + requestId)
+  if (el) el.remove()
+}
+
+function sendApprovalResponse(requestId, body) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify(Object.assign({ type: 'approval_response', requestId }, body)))
+  }
+  removeApprovalRequest(requestId)
+}
+
+function showApprovalRequest(data) {
+  if (document.getElementById('approval-' + data.requestId)) return
+  const card = document.createElement('div')
+  card.id = 'approval-' + data.requestId
+  card.className = 'approval-card'
+
+  if (data.subtype === 'request_user_dialog' && data.payload && Array.isArray(data.payload.questions)) {
+    renderQuestionCard(card, data)
+  } else if (data.subtype === 'can_use_tool') {
+    renderToolPermissionCard(card, data)
+  } else {
+    // Unknown dialog kind — surface a generic allow/cancel so the turn never
+    // hangs waiting on a card we don't know how to render.
+    renderGenericCard(card, data)
+  }
+
+  messages.insertBefore(card, typing)
+  scrollBottom()
+}
+
+// AskUserQuestion: one block per question, options as tappable buttons, plus a
+// free-text box (Claude's AskUserQuestion always allows a custom answer).
+function renderQuestionCard(card, data) {
+  const questions = data.payload.questions
+  const input = data.input || {}
+  const selected = {}        // question text -> chosen answer string
+
+  const head = document.createElement('div')
+  head.className = 'approval-head'
+  head.textContent = '💬 Claude is asking'
+  card.appendChild(head)
+
+  questions.forEach((q, qi) => {
+    const block = document.createElement('div')
+    block.className = 'approval-q'
+    if (q.header) {
+      const chip = document.createElement('div')
+      chip.className = 'approval-chip'
+      chip.textContent = q.header
+      block.appendChild(chip)
+    }
+    const qtext = document.createElement('div')
+    qtext.className = 'approval-qtext'
+    qtext.textContent = q.question
+    block.appendChild(qtext)
+
+    const multi = !!q.multiSelect
+    const chosen = new Set()
+    ;(q.options || []).forEach(opt => {
+      const btn = document.createElement('button')
+      btn.className = 'approval-opt'
+      btn.innerHTML = '<b>' + escapeHtml(opt.label) + '</b>' +
+        (opt.description ? '<span>' + escapeHtml(opt.description) + '</span>' : '')
+      btn.onclick = () => {
+        if (multi) {
+          if (chosen.has(opt.label)) { chosen.delete(opt.label); btn.classList.remove('sel') }
+          else { chosen.add(opt.label); btn.classList.add('sel') }
+          selected[q.question] = Array.from(chosen).join(', ')
+        } else {
+          block.querySelectorAll('.approval-opt').forEach(b => b.classList.remove('sel'))
+          btn.classList.add('sel')
+          selected[q.question] = opt.label
+        }
+      }
+      block.appendChild(btn)
+    })
+
+    const free = document.createElement('input')
+    free.className = 'approval-free'
+    free.type = 'text'
+    free.placeholder = 'Or type a custom answer…'
+    free.oninput = () => {
+      if (free.value.trim()) {
+        selected[q.question] = free.value.trim()
+        block.querySelectorAll('.approval-opt').forEach(b => b.classList.remove('sel'))
+      }
+    }
+    block.appendChild(free)
+    card.appendChild(block)
+  })
+
+  const actions = document.createElement('div')
+  actions.className = 'approval-actions'
+  const submit = document.createElement('button')
+  submit.className = 'approval-btn primary'
+  submit.textContent = 'Send'
+  submit.onclick = () => {
+    // Require an answer for every question before sending.
+    for (const q of questions) {
+      if (!selected[q.question]) { free_flash(card); return }
+    }
+    sendApprovalResponse(data.requestId, {
+      decision: 'allow',
+      updatedInput: Object.assign({}, input, { answers: selected }),
+    })
+  }
+  const cancel = document.createElement('button')
+  cancel.className = 'approval-btn'
+  cancel.textContent = 'Cancel'
+  cancel.onclick = () => sendApprovalResponse(data.requestId, { decision: 'cancel' })
+  actions.appendChild(cancel)
+  actions.appendChild(submit)
+  card.appendChild(actions)
+}
+
+function free_flash(card) {
+  card.classList.add('flash')
+  setTimeout(() => card.classList.remove('flash'), 400)
+}
+
+// can_use_tool: a tool wants permission. Show what it is and Allow / Deny.
+function renderToolPermissionCard(card, data) {
+  const head = document.createElement('div')
+  head.className = 'approval-head'
+  head.textContent = '🔐 ' + (data.displayName || data.toolName || 'Tool') + ' needs permission'
+  card.appendChild(head)
+
+  if (data.input) {
+    const pre = document.createElement('pre')
+    pre.className = 'approval-input'
+    let s
+    try { s = JSON.stringify(data.input, null, 2) } catch { s = String(data.input) }
+    if (s.length > 800) s = s.slice(0, 800) + '\\n…'
+    pre.textContent = s
+    card.appendChild(pre)
+  }
+
+  const actions = document.createElement('div')
+  actions.className = 'approval-actions'
+  const deny = document.createElement('button')
+  deny.className = 'approval-btn danger'
+  deny.textContent = 'Deny'
+  deny.onclick = () => sendApprovalResponse(data.requestId, { decision: 'deny', message: 'Denied from phone' })
+  const allow = document.createElement('button')
+  allow.className = 'approval-btn primary'
+  allow.textContent = 'Allow'
+  allow.onclick = () => sendApprovalResponse(data.requestId, { decision: 'allow', updatedInput: data.input || {} })
+  actions.appendChild(deny)
+  actions.appendChild(allow)
+  card.appendChild(actions)
+}
+
+function renderGenericCard(card, data) {
+  const head = document.createElement('div')
+  head.className = 'approval-head'
+  head.textContent = '💬 ' + (data.dialogKind || 'Claude needs a response')
+  card.appendChild(head)
+  const actions = document.createElement('div')
+  actions.className = 'approval-actions'
+  const cancel = document.createElement('button')
+  cancel.className = 'approval-btn'
+  cancel.textContent = 'Dismiss'
+  cancel.onclick = () => sendApprovalResponse(data.requestId, { decision: 'cancel' })
+  actions.appendChild(cancel)
+  card.appendChild(actions)
 }
 
 function showUpdateBanner() {

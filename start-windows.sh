@@ -50,6 +50,12 @@ export DISABLE_AUTOUPDATER=1
 export DISABLE_TELEMETRY=1
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
+# 交互式对话/审批转发：让服务在 initialize 握手声明 supportedDialogKinds，
+# 使 Claude 的 AskUserQuestion / plan 确认 / 工具审批弹到手机（否则 CLI
+# fail-closed 静默降级、手机收不到提问）。详见 app/server.ts DIALOGS_ENABLED。
+# 如需临时关闭：在 env.local.sh 设 POCKET_CLAUDE_DIALOGS=0。
+export POCKET_CLAUDE_DIALOGS="${POCKET_CLAUDE_DIALOGS:-1}"
+
 # 工作目录：手机新建会话即在此目录启动（带上你的 CLAUDE.md / agents / skills）。
 # 默认当前目录；在 env.local.sh 用 POCKET_CLAUDE_CWD 指定你的项目目录。
 export POCKET_CLAUDE_CWD="${POCKET_CLAUDE_CWD:-$(pwd)}"

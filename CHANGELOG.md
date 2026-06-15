@@ -1,5 +1,41 @@
 # Changelog
 
+## [Unreleased] - 2026-06-15
+
+### Fixed (realtime layer — phone "reconnecting" / stale session / dropped messages)
+- **WS keep-alive**: added `idleTimeout: 300` to the Bun `websocket` config + a
+  client-side 25s ping/pong heartbeat. Bun's default ~120s idle close was tearing
+  down sockets while an iOS PWA was backgrounded, leaving a half-open connection
+  that silently dropped every `delta`/`status` event (root cause of "reconnecting"
+  forever and the typing animation flashing then vanishing with no new message).
+- **Reconnect**: exponential backoff (1s→15s, reset on clean open), single pending
+  timer (no connection storms), half-open detection (no pong within 60s → force
+  reconnect), and proactive reconnect on `visibilitychange`/`online` so returning
+  to the foreground reconnects immediately instead of waiting out the timer.
+- **In-flight bubbles**: `delta`/`complete` now auto-create the assistant bubble if
+  it's missing (the originating `msg` was lost to a dropped socket), so streamed
+  output after a reconnect is never silently discarded.
+- **Auto-reload on resume**: `session_updated` now auto-triggers `reload_session`
+  instead of only showing a manual "tap to reload" banner — messages load without
+  a tab/refocus.
+
+### Added (interactive dialogs / approvals — feature-flagged)
+- `control_request` protocol bridge over the persistent stream-json channel:
+  forwards Claude's interactive `request_user_dialog` (AskUserQuestion multiple-
+  choice + free-text, plan-mode confirmation) and `can_use_tool` permission prompts
+  to the phone as `approval_request`, collects the answer, and writes the matching
+  `control_response` back to the CLI's stdin so the turn continues.
+- `initialize` handshake declaring `supportedDialogKinds`
+  (`ask_user_question`, `plan_dialog_choice`, `refusal_fallback_prompt`) — without
+  this the CLI fails closed and silently proceeds without the user's answer.
+- Phone UI: in-chat approval card (question/options/multiSelect/free-text; tool
+  Allow/Deny), per-dialog timeout (`POCKET_CLAUDE_DIALOG_TIMEOUT_MS`, default 5min),
+  and cleanup of pending dialogs when the process dies.
+- **Gated behind `POCKET_CLAUDE_DIALOGS=1`** (default off) pending a live protocol
+  probe of the `initialize` handshake against the installed CLI (2.1.177). Transport
+  wiring verified locally (ping/pong, bogus-response safety, clean spawn with flag on);
+  the live dialog round-trip still needs valid Bedrock creds to exercise.
+
 ## [1.0.0] - 2026-05-23
 
 ### Changed
