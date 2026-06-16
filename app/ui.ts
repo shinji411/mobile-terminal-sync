@@ -1362,10 +1362,9 @@ function renderQuestionCard(card, data) {
     for (const q of questions) {
       if (!selected[q.question]) { free_flash(card); return }
     }
-    sendApprovalResponse(data.requestId, {
-      decision: 'allow',
-      updatedInput: Object.assign({}, input, { answers: selected }),
-    })
+    // Send only the answers map; the server merges it into the original tool
+    // input it captured (it ignores any client-supplied tool input — security).
+    sendApprovalResponse(data.requestId, { decision: 'allow', answers: selected })
   }
   const cancel = document.createElement('button')
   cancel.className = 'approval-btn'
@@ -1407,7 +1406,7 @@ function renderToolPermissionCard(card, data) {
   const allow = document.createElement('button')
   allow.className = 'approval-btn primary'
   allow.textContent = 'Allow'
-  allow.onclick = () => sendApprovalResponse(data.requestId, { decision: 'allow', updatedInput: data.input || {} })
+  allow.onclick = () => sendApprovalResponse(data.requestId, { decision: 'allow' })
   actions.appendChild(deny)
   actions.appendChild(allow)
   card.appendChild(actions)

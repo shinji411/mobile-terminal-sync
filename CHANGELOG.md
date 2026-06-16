@@ -2,6 +2,32 @@
 
 ## [Unreleased] - 2026-06-15
 
+### Security / robustness (P1 review fixes)
+- **Tool-input injection**: the approval flow no longer trusts the phone's
+  `updatedInput` as a tool-arg replacement. The server captures the original
+  tool input in the pending-dialog record and rebuilds the `PermissionResult`
+  from it; for AskUserQuestion it merges only the phone's `answers` map (every
+  other client key is ignored), so a compromised client cannot rewrite a Bash
+  command or Write path through an approval.
+- **Cross-session answers / guessable ids**: `requestId` is now
+  `crypto.randomBytes` (was a predictable counter), and `approval_response` is
+  rejected unless the answering connection owns the dialog's session.
+- **Rate-limit / size-guard bypass**: the raw-frame size check and the
+  per-connection rate limit now run at the very top of the WS message handler,
+  before `JSON.parse` and before any type-specific branch — `ping` and
+  `approval_response` previously short-circuited ahead of them and could be
+  flooded to spin the single-threaded event loop.
+- **Concurrent-turn race**: `isProcessing` stays set across the post-turn
+  `await`s and is cleared synchronously with the drain decision, so a message
+  arriving during that await window can no longer start a second concurrent
+  turn that clobbers the in-flight one.
+- **State / watcher leaks**: `DELETE /api/sessions/:id` now also clears the
+  session's in-memory turn state and fs watcher (a session deleted mid-turn no
+  longer leaves a ghost that wedges the concurrent-session cap); a periodic GC
+  reclaims provably-inert session states left behind by idle/LRU pool teardown;
+  and the file-watcher debounce timer is tracked and cleared on unwatch so a
+  late timer can't resurrect a removed watcher or emit a stale `session_updated`.
+
 ### Fixed (Computer Sessions list — duplicate conversation entries)
 - Resuming a session forks a new `.jsonl` (new sessionId) that shares its
   parent's cwd + opening user message, so one conversation appeared as many

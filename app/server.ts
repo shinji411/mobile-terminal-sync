@@ -80,6 +80,24 @@ setInterval(() => {
   }
 }, RATE_WINDOW_MS).unref?.()
 
+// P1 (leak): sessionStates GC. DELETE cleans its own entry, but idle/LRU pool
+// teardown intentionally keeps the session's state (queue + lastProcessedAt)
+// so the next message can re-spawn and drain in order. Those states would
+// still accumulate for sessions never explicitly deleted. Reclaim a state only
+// when it is provably inert: not processing, empty queue, no live pool entry,
+// and untouched for well past the pool idle window. Anything active or
+// recently used is left alone, so this can't drop a queued turn.
+const SESSION_STATE_TTL_MS = 30 * 60 * 1000
+setInterval(() => {
+  const now = Date.now()
+  for (const [id, s] of sessionStates) {
+    if (s.isProcessing || s.queue.length > 0) continue
+    if (persistentProcs.has(id)) continue
+    if (now - s.lastProcessedAt < SESSION_STATE_TTL_MS) continue
+    sessionStates.delete(id)
+  }
+}, SESSION_STATE_TTL_MS).unref?.()
+
 function activeSessionCount(): number {
   let n = 0
   for (const s of sessionStates.values()) if (s.isProcessing) n++
@@ -87,7 +105,7 @@ function activeSessionCount(): number {
 }
 
 // --- Session file watchers (detect external changes) ---
-const sessionWatchers = new Map<string, { watcher: ReturnType<typeof watch>; lastSize: number }>()
+const sessionWatchers = new Map<string, { watcher: ReturnType<typeof watch>; lastSize: number; debounceTimer: ReturnType<typeof setTimeout> | null }>()
 
 function findJsonlPath(claudeSessionId: string): string | null {
   const projectDirs = readdirSync(join(homedir(), '.claude', 'projects')).filter(d => !d.startsWith('.'))
@@ -213,18 +231,24 @@ function watchSession(sessionId: string) {
   if (!jsonlPath) return
 
   const lastSize = statSync(jsonlPath).size
-  let debounceTimer: ReturnType<typeof setTimeout> | null = null
 
   const watcher = watch(jsonlPath, () => {
-    if (debounceTimer) clearTimeout(debounceTimer)
-    debounceTimer = setTimeout(() => {
+    const cur = sessionWatchers.get(sessionId)
+    if (!cur) return                     // unwatched between fire and now
+    if (cur.debounceTimer) clearTimeout(cur.debounceTimer)
+    cur.debounceTimer = setTimeout(() => {
+      // The watcher may have been torn down during the 800ms debounce; bail if
+      // so, otherwise a late timer would resurrect a removed map entry / fire a
+      // stale session_updated. (P1 leak/ghost fix.)
+      const entry = sessionWatchers.get(sessionId)
+      if (!entry) return
+      entry.debounceTimer = null
       const state = getSessionState(sessionId)
       // Ignore changes from our own process or within 5s after it finishes
       if (state.isProcessing || (Date.now() - state.lastProcessedAt < 5000)) return
       try {
         const newSize = statSync(jsonlPath).size
-        const entry = sessionWatchers.get(sessionId)
-        if (entry && newSize > entry.lastSize) {
+        if (newSize > entry.lastSize) {
           entry.lastSize = newSize
           broadcastToSession(sessionId, { type: 'session_updated' })
         }
@@ -232,12 +256,13 @@ function watchSession(sessionId: string) {
     }, 800)
   })
 
-  sessionWatchers.set(sessionId, { watcher, lastSize })
+  sessionWatchers.set(sessionId, { watcher, lastSize, debounceTimer: null })
 }
 
 function unwatchSession(sessionId: string) {
   const entry = sessionWatchers.get(sessionId)
   if (entry) {
+    if (entry.debounceTimer) clearTimeout(entry.debounceTimer)
     entry.watcher.close()
     sessionWatchers.delete(sessionId)
   }
@@ -631,6 +656,12 @@ const DIALOG_TIMEOUT_MS = Number(process.env.POCKET_CLAUDE_DIALOG_TIMEOUT_MS ?? 
 type PendingDialog = {
   requestId: string
   sessionId: string
+  toolName: string
+  // The ORIGINAL tool input the SDK handed us. The server rebuilds the
+  // PermissionResult.updatedInput from this — never from raw phone data — so a
+  // compromised/XSS'd phone cannot rewrite arbitrary tool args (e.g. swap a
+  // Bash command, redirect a Write path). See approval_response handler.
+  origInput: Record<string, unknown>
   resolve: (result: PermissionResult) => void
   timer: ReturnType<typeof setTimeout> | null
 }
@@ -651,14 +682,16 @@ function resolvePendingDialog(requestId: string, result: PermissionResult) {
 // session so we know where to broadcast.
 function makeCanUseTool(sessionId: string) {
   return (toolName: string, input: Record<string, unknown>, _opts: any): Promise<PermissionResult> => {
-    const requestId = nextId()
+    // Unguessable id (P1): the old nextId() counter was predictable, letting a
+    // malicious client forge an approval_response for a request it never saw.
+    const requestId = require('crypto').randomBytes(16).toString('hex')
     return new Promise<PermissionResult>((resolve) => {
       const timer = setTimeout(() => {
         plog(`dialog ${requestId} (${toolName}) timed out after ${DIALOG_TIMEOUT_MS}ms — auto-cancelling`)
         resolvePendingDialog(requestId, { behavior: 'deny', message: '已超时（手机未在限定时间内响应）' } as PermissionResult)
         broadcastToSession(sessionId, { type: 'approval_cancelled', requestId })
       }, DIALOG_TIMEOUT_MS)
-      pendingDialogs.set(requestId, { requestId, sessionId, resolve, timer })
+      pendingDialogs.set(requestId, { requestId, sessionId, toolName, origInput: input, resolve, timer })
       // Forward to the phone. For AskUserQuestion the questions live in `input`;
       // the client renders options + free-text. For other tools it renders a
       // permission card (Allow / Deny) from toolName + input.
@@ -991,11 +1024,17 @@ async function sendToClaude(text: string, sessionId: string) {
     broadcastToSession(sessionId, { type: 'error', text: '无法启动 Claude 会话，请检查电脑端服务' })
   }
 
-  state.isProcessing = false
   state.lastProcessedAt = Date.now()
 
   // Update watcher size so our own writes don't trigger the banner.
   // Async (P1-3c) — runs at the end of every message turn (hot path).
+  //
+  // P1 (concurrency): isProcessing MUST stay true across this await. The await
+  // yields the event loop; if a new WS message for this same session arrives
+  // during that window and isProcessing were already false, it would pass the
+  // guard in sendToClaude and start a SECOND concurrent turn — clobbering
+  // entry.currentTurn. We keep the turn marked busy until the drain decision
+  // below, so a concurrent message queues instead of racing.
   const freshSession = getSession(sessionId)
   if (freshSession?.claudeSessionId) {
     const jsonlPath = await findJsonlPathAsync(freshSession.claudeSessionId)
@@ -1004,6 +1043,12 @@ async function sendToClaude(text: string, sessionId: string) {
       try { watchEntry.lastSize = (await statAsync(jsonlPath)).size } catch {}
     }
   }
+
+  // Now that all awaits are done, flip isProcessing false synchronously and
+  // make the drain decision in the same tick — no await can interleave between
+  // here and the next sendToClaude, so a concurrent message can't start a
+  // second turn through the idle window.
+  state.isProcessing = false
 
   // Drain queued messages (sent while we were busy) in order.
   // Note: no `!state.aborted` check here — abortClaude already emptied the
@@ -1195,6 +1240,12 @@ Bun.serve({
     if (url.pathname.startsWith('/api/sessions/') && req.method === 'DELETE') {
       const id = url.pathname.split('/')[3]
       killPersistentProc(id, 'session-deleted')
+      // P1 (leak): also drop the in-memory turn state and the fs watcher.
+      // Without this, sessionStates grows unbounded, and a session deleted
+      // mid-turn (isProcessing=true) leaves a ghost that permanently counts
+      // toward activeSessionCount — eventually wedging MAX_ACTIVE_SESSIONS.
+      unwatchSession(id)
+      sessionStates.delete(id)
       deleteSession(id)
       return json({ ok: true })
     }
@@ -1443,7 +1494,28 @@ Bun.serve({
     },
     message(ws, raw) {
       try {
-        const data = JSON.parse(String(raw)) as any
+        // Frame-size guard (P1): reject oversized frames BEFORE JSON.parse, for
+        // EVERY message type. The single-threaded event loop must not be made
+        // to parse a multi-megabyte payload — that alone is a DoS, regardless of
+        // the message type. Bun gives us the raw frame; cap it generously above
+        // MAX_MESSAGE_BYTES to leave room for JSON envelope overhead.
+        const rawStr = String(raw)
+        if (rawStr.length > MAX_MESSAGE_BYTES + 8 * 1024) {
+          if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'error', text: '消息过大，请精简后重发' }))
+          return
+        }
+
+        // Rate limit (P1): applies to EVERY message type, before any work —
+        // ping and approval_response previously short-circuited above this and
+        // could be flooded to spin the event loop / Bedrock. The legitimate
+        // 25s heartbeat is far under RATE_MAX_MSGS, so honest clients are
+        // unaffected; a flood of any frame type is throttled.
+        if (!rateLimitAllow(ws.data.rateKey)) {
+          if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'error', text: '发送过于频繁，请稍后再试（每分钟最多 ' + RATE_MAX_MSGS + ' 条）' }))
+          return
+        }
+
+        const data = JSON.parse(rawStr) as any
 
         // App-level heartbeat: the client pings every 25s. Replying lets the
         // client distinguish a live socket from a half-open one (a TCP that
@@ -1454,25 +1526,43 @@ Bun.serve({
         }
 
         // Answer to a forwarded dialog / tool-permission request. The phone
-        // (which holds the full request payload) sends
-        //   { requestId, decision: 'allow'|'deny'|'cancel', updatedInput?, message? }
-        // and we settle the SDK canUseTool promise with a PermissionResult:
-        //   - allow:  { behavior:'allow', updatedInput:{...} }
-        //             (for AskUserQuestion updatedInput carries
-        //              { ...toolInput, answers:{ [question]: answer } })
+        // sends { requestId, decision: 'allow'|'deny'|'cancel', answers?, message? }.
+        // We settle the SDK canUseTool promise with a PermissionResult that the
+        // SERVER builds from the original tool input it captured — the phone's
+        // raw input is never trusted as a tool-arg replacement:
+        //   - allow:  { behavior:'allow', updatedInput }, where updatedInput is
+        //             the original input, plus (AskUserQuestion only) the phone's
+        //             `answers` map merged in. No other phone key is honored.
         //   - deny:   { behavior:'deny', message:'...' }
-        //   - cancel: mapped to deny (canUseTool has no 'cancelled' result; a
-        //             cancelled AskUserQuestion just declines to answer).
+        //   - cancel: mapped to deny (canUseTool has no 'cancelled' result).
         if (data.type === 'approval_response') {
           const pd = pendingDialogs.get(data.requestId)
           if (!pd) return                 // already resolved / timed out / session ended
+          // Ownership check (P1): only the connection that owns this dialog's
+          // session may answer it — otherwise a second device/connection could
+          // answer (or, with a leaked id, inject) another session's prompt.
+          if (pd.sessionId !== ws.data.sessionId) {
+            plog(`approval_response for ${data.requestId} rejected: session mismatch (pd=${pd.sessionId}, ws=${ws.data.sessionId})`)
+            return
+          }
           let result: PermissionResult
           if (data.decision === 'deny') {
-            result = { behavior: 'deny', message: data.message || 'Denied by user' } as PermissionResult
+            result = { behavior: 'deny', message: '已拒绝' } as PermissionResult
           } else if (data.decision === 'cancel') {
             result = { behavior: 'deny', message: '已取消' } as PermissionResult
           } else {
-            result = { behavior: 'allow', updatedInput: data.updatedInput ?? {} } as PermissionResult
+            // allow: rebuild updatedInput server-side from the captured original
+            // input. For AskUserQuestion, merge ONLY the phone's answers (a
+            // record of question→answer strings); ignore every other key.
+            let updatedInput: Record<string, unknown> = pd.origInput
+            if (pd.toolName === 'AskUserQuestion' && data.answers && typeof data.answers === 'object') {
+              const answers: Record<string, string> = {}
+              for (const [q, a] of Object.entries(data.answers as Record<string, unknown>)) {
+                answers[String(q)] = String(a)
+              }
+              updatedInput = { ...pd.origInput, answers }
+            }
+            result = { behavior: 'allow', updatedInput } as PermissionResult
           }
           resolvePendingDialog(data.requestId, result)
           return
@@ -1549,16 +1639,12 @@ Bun.serve({
         const { id, text } = data
         if (!id || !text?.trim() || !ws.data.sessionId) return
 
-        // Per-message size cap (P2): reject oversized payloads before they hit
-        // Claude/Bedrock. Byte-length, not char-length (multi-byte aware).
+        // Per-message content size cap (P2): reject oversized user text before
+        // it hits Claude/Bedrock. Byte-length, not char-length (multi-byte
+        // aware). The raw-frame guard + rate limit at the top of message()
+        // already cover all types; this is the tighter content-specific bound.
         if (Buffer.byteLength(text, 'utf-8') > MAX_MESSAGE_BYTES) {
           ws.send(JSON.stringify({ type: 'error', text: `消息过大（上限 ${Math.round(MAX_MESSAGE_BYTES / 1024)}KB），请精简后重发` }))
-          return
-        }
-
-        // Rate limit (P2): protect against flood → Bedrock billing / resource DoS.
-        if (!rateLimitAllow(ws.data.rateKey)) {
-          ws.send(JSON.stringify({ type: 'error', text: '发送过于频繁，请稍后再试（每分钟最多 ' + RATE_MAX_MSGS + ' 条）' }))
           return
         }
 
