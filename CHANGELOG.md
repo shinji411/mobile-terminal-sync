@@ -2,6 +2,32 @@
 
 ## [Unreleased] - 2026-06-15
 
+### Robustness (P2 review fixes)
+- **Per-turn watchdog**: a turn whose SDK stream goes silent (no event, no end)
+  for `POCKET_CLAUDE_TURN_WATCHDOG_MS` (default 10min) is now torn down and
+  surfaced instead of hanging `isProcessing` forever (which also blocked the
+  queue and idle reaper). Re-armed on every stream event; suspended while an
+  interactive dialog is outstanding (the user's think-time isn't a stall).
+- **claudeSessionId capture** only on the `init` system message, not every
+  system message — overwriting on later ones aggravated stale-resume.
+- **Recap hardening**: the `claude -p --resume` recap call now has a 60s
+  timeout that kills the process tree, drains stderr (an unread pipe can stall
+  the child), and refuses to run against a session busy in another terminal
+  (same .jsonl write-race the resume guard blocks).
+- **Process teardown**: added `SIGHUP` + `uncaughtException` handlers that reap
+  child processes before exit (no orphaned claude subprocesses / wedged port);
+  `unhandledRejection` is logged without killing the server.
+- **Wildcard-bind guard**: the server refuses to start on `0.0.0.0`/`::`
+  (which would expose the single-token bridge beyond Tailscale) unless
+  `POCKET_CLAUDE_ALLOW_WILDCARD_BIND=1` is set.
+- **Phone UI**: approval answers are no longer silently dropped when the socket
+  is down — the card stays and the user is told to retry after reconnect;
+  option buttons / free-text / multi-select now share one source of truth so a
+  custom answer can't be sent alongside a stale option; and an auto-reload
+  triggered by another device is deferred until the current stream finishes so
+  it can't wipe the in-flight bubble; reconnect logic tears down any prior
+  socket (single-flight) to avoid overlapping connections.
+
 ### Security / robustness (P1 review fixes)
 - **Tool-input injection**: the approval flow no longer trusts the phone's
   `updatedInput` as a tool-arg replacement. The server captures the original

@@ -814,6 +814,7 @@ let currentSessionId = null
 let sessions = []
 let isThinking = false
 let userAtBottom = true
+let pendingReload = false   // a session_updated arrived mid-stream; reload once idle
 
 function apiFetch(url, options = {}) {
   const headers = Object.assign({}, options.headers || {})
@@ -1096,15 +1097,10 @@ function scheduleReconnect() {
 }
 
 // Force a fresh socket NOW (used by heartbeat-timeout and foreground/online).
-// Tears down the current socket without letting its onclose re-schedule, then
-// reconnects immediately with the backoff reset.
+// connect() handles tearing down the current socket (single-flight); we just
+// reset the backoff so the immediate reconnect doesn't inherit a long delay.
 function reconnectNow() {
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
   reconnectDelay = 1000
-  clearTimers()
-  if (ws) {
-    try { manualClose = true; ws.onclose = null; ws.onerror = null; ws.close() } catch {}
-  }
   connect()
 }
 
@@ -1123,6 +1119,17 @@ function startHeartbeat() {
 }
 
 function connect() {
+  // Single-flight teardown: never leave a prior socket alive when opening a new
+  // one. connect() is reached from the backoff timer, visibilitychange, and
+  // reconnectNow(); without this, two of those racing (or a late onclose) would
+  // leave two sockets both receiving deltas/status → duplicated/garbled UI.
+  // Detach handlers on the old socket so its onclose can't re-schedule.
+  if (ws) {
+    try { ws.onclose = null; ws.onerror = null; ws.onmessage = null; ws.onopen = null; ws.close() } catch {}
+    ws = null
+  }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+  clearTimers()
   manualClose = false
   const sessionParam = currentSessionId ? '&session=' + currentSessionId : ''
   ws = new WebSocket(proto + '//' + location.host + '/ws?token=' + token + sessionParam)
@@ -1175,6 +1182,11 @@ function connect() {
         sendBtn.textContent = '↑'
         sendBtn.classList.remove('abort')
         autoResize()
+        // Flush a reload deferred during streaming (see session_updated).
+        if (pendingReload && currentSessionId && ws && ws.readyState === 1) {
+          pendingReload = false
+          ws.send(JSON.stringify({ type: 'reload_session', sessionId: currentSessionId }))
+        }
       }
     } else if (data.type === 'error') {
       showErrorNotice(data.text)
@@ -1184,8 +1196,15 @@ function connect() {
       // Auto-reload (Joe's choice) instead of the manual "tap to reload"
       // banner: pull the latest messages from the resumed conversation as
       // soon as activity is detected on another device.
+      // BUT not while a turn is streaming here: reload_session replies with a
+      // history payload that clearMessages()+rerenders, which would wipe the
+      // live streaming bubble. Defer the reload until the turn goes idle.
       if (currentSessionId && ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({ type: 'reload_session', sessionId: currentSessionId }))
+        if (isThinking) {
+          pendingReload = true
+        } else {
+          ws.send(JSON.stringify({ type: 'reload_session', sessionId: currentSessionId }))
+        }
       }
     } else if (data.type === 'approval_request') {
       showApprovalRequest(data)
@@ -1265,10 +1284,20 @@ function removeApprovalRequest(requestId) {
 }
 
 function sendApprovalResponse(requestId, body) {
+  // Only dismiss the card if the answer actually went out. If the socket is
+  // down (backgrounded phone, mid-reconnect), removing the card would silently
+  // drop the user's answer and leave Claude waiting until the server-side
+  // dialog timeout. Keep it up and tell them to retry once reconnected.
   if (ws && ws.readyState === 1) {
-    ws.send(JSON.stringify(Object.assign({ type: 'approval_response', requestId }, body)))
+    try {
+      ws.send(JSON.stringify(Object.assign({ type: 'approval_response', requestId }, body)))
+      removeApprovalRequest(requestId)
+    } catch {
+      showErrorNotice('发送失败，请重连后重试')
+    }
+  } else {
+    showErrorNotice('连接已断开，重连后请重新作答')
   }
-  removeApprovalRequest(requestId)
 }
 
 function showApprovalRequest(data) {
@@ -1319,33 +1348,51 @@ function renderQuestionCard(card, data) {
 
     const multi = !!q.multiSelect
     const chosen = new Set()
+    const free = document.createElement('input')   // declared first so option clicks can clear it
+
+    // Recompute selected[q] from the single source of truth (the chosen Set),
+    // so option buttons and the free-text box can never drift out of sync.
+    const syncSelected = () => {
+      if (chosen.size > 0) selected[q.question] = Array.from(chosen).join(', ')
+      else delete selected[q.question]
+    }
+
     ;(q.options || []).forEach(opt => {
       const btn = document.createElement('button')
       btn.className = 'approval-opt'
       btn.innerHTML = '<b>' + escapeHtml(opt.label) + '</b>' +
         (opt.description ? '<span>' + escapeHtml(opt.description) + '</span>' : '')
       btn.onclick = () => {
+        // Choosing an option supersedes any free-text entry.
+        if (free.value) free.value = ''
         if (multi) {
           if (chosen.has(opt.label)) { chosen.delete(opt.label); btn.classList.remove('sel') }
           else { chosen.add(opt.label); btn.classList.add('sel') }
-          selected[q.question] = Array.from(chosen).join(', ')
         } else {
+          chosen.clear()
           block.querySelectorAll('.approval-opt').forEach(b => b.classList.remove('sel'))
+          chosen.add(opt.label)
           btn.classList.add('sel')
-          selected[q.question] = opt.label
         }
+        syncSelected()
       }
       block.appendChild(btn)
     })
 
-    const free = document.createElement('input')
     free.className = 'approval-free'
     free.type = 'text'
     free.placeholder = 'Or type a custom answer…'
     free.oninput = () => {
-      if (free.value.trim()) {
-        selected[q.question] = free.value.trim()
+      const v = free.value.trim()
+      if (v) {
+        // Free text supersedes option selections: clear the Set + highlights so
+        // we never send "OptionA, customtext" or a stale option.
+        chosen.clear()
         block.querySelectorAll('.approval-opt').forEach(b => b.classList.remove('sel'))
+        selected[q.question] = v
+      } else {
+        // Cleared the box and nothing selected → no answer for this question.
+        delete selected[q.question]
       }
     }
     block.appendChild(free)

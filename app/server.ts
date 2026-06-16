@@ -29,6 +29,20 @@ const config = loadConfig()
 const PORT = Number(process.env.POCKET_CLAUDE_PORT ?? config.port)
 const HOST = process.env.POCKET_CLAUDE_HOST ?? config.host
 const WORK_DIR = process.env.POCKET_CLAUDE_CWD ?? config.workDir
+
+// Bind guard (P2): pocket-claude's security model is "reachable only over the
+// Tailscale interface" — the launcher binds the Tailscale IP, never a wildcard.
+// Binding 0.0.0.0 / :: would expose the single-token bridge to the whole LAN
+// (and, behind some routers, the internet). Refuse to start on a wildcard bind
+// unless explicitly forced, so a mis-set config can't silently widen exposure.
+if ((HOST === '0.0.0.0' || HOST === '::') && process.env.POCKET_CLAUDE_ALLOW_WILDCARD_BIND !== '1') {
+  process.stderr.write(
+    `\n[refusing to start] HOST=${HOST} is a wildcard bind — this exposes pocket-claude beyond Tailscale.\n` +
+    `Use the Tailscale IP (./start-windows.sh sets it), '127.0.0.1' for local testing,\n` +
+    `or set POCKET_CLAUDE_ALLOW_WILDCARD_BIND=1 if you really intend a public bind.\n\n`
+  )
+  process.exit(1)
+}
 const TOKEN = getOrCreateToken()
 const CLAUDE_SESSIONS_DIR = join(homedir(), '.claude', 'sessions')
 const WORK_DIR_REAL = realpathSync(WORK_DIR)
@@ -279,6 +293,23 @@ function nextId() {
   return `a${Date.now()}-${++seq}`
 }
 
+// Kill a spawned process AND its descendants. claude.exe spawns children (node
+// shim, MCP servers, agent bash) that hold their own handles — on Windows
+// proc.kill() only ends the direct child, orphaning the rest. taskkill /T walks
+// the tree; /F is required because orphans have no console for a soft signal.
+// Used by the recap path (the only remaining raw spawn; the SDK manages its own
+// subprocesses for normal turns).
+function killProcTree(proc: ReturnType<typeof spawn>) {
+  let treeKilled = false
+  if (process.platform === 'win32' && proc.pid) {
+    try {
+      const r = Bun.spawnSync(['taskkill', '/T', '/F', '/PID', String(proc.pid)])
+      treeKilled = r.exitCode === 0
+    } catch {}
+  }
+  if (!treeKilled) { try { proc.kill() } catch {} }
+}
+
 function isAuthorized(req: Request, url: URL): boolean {
   const auth = req.headers.get('authorization') || ''
   const bearer = auth.match(/^Bearer\s+(.+)$/i)?.[1] || ''
@@ -488,10 +519,15 @@ function createTurnParser(sessionId: string, state: SessionState): TurnParser {
       if (resultSeen) return true
       if (state.aborted) return false
 
-      if (data.type === 'system' && data.session_id) {
-        updateSession(sessionId, { claudeSessionId: data.session_id })
+      // Capture the canonical claudeSessionId ONLY from the init system
+      // message (P2): later system messages can carry a forked/derived id, and
+      // overwriting on every one of them aggravates stale-resume (a subsequent
+      // turn would --resume the wrong branch). The authoritative end-of-turn id
+      // is also captured from the result message below.
+      if (data.type === 'system' && data.subtype === 'init') {
+        if (data.session_id) updateSession(sessionId, { claudeSessionId: data.session_id })
         // Show recap if present (shown when resuming a session)
-        if (data.subtype === 'init' && data.content) {
+        if (data.content) {
           const recapId = nextId()
           const msg: Message = { id: recapId, from: 'assistant', text: '*※ ' + data.content + '*', ts: Date.now(), sessionId }
           broadcastToSession(sessionId, { type: 'msg', ...msg })
@@ -640,6 +676,13 @@ function createTurnParser(sessionId: string, state: SessionState): TurnParser {
 
 const MAX_PERSISTENT_PROCS = 3
 const PERSISTENT_IDLE_MS = 15 * 60 * 1000
+// Per-turn watchdog (P2): if the SDK stream neither emits an event nor ends for
+// this long, treat the turn as wedged — tear the session down so it can't hang
+// isProcessing forever (which would also block the queue and the idle reaper).
+// Generous: a long agentic turn streams *something* (tool events, thinking)
+// well within this; only a truly stuck stream trips it. A pending interactive
+// dialog is NOT a stall — the watchdog is suspended while one is outstanding.
+const TURN_WATCHDOG_MS = Number(process.env.POCKET_CLAUDE_TURN_WATCHDOG_MS ?? 10 * 60 * 1000)
 
 // --- Interactive dialogs / approvals (canUseTool forwarding) ---
 // The SDK calls our canUseTool(toolName, input, opts) before a tool runs. For
@@ -941,21 +984,50 @@ async function sendViaPersistent(text: string, sessionId: string, state: Session
   const parser = createTurnParser(sessionId, state)
   const turnStart = Date.now()
 
-  const outcome = await new Promise<'ok' | 'exit'>((resolve) => {
+  const outcome = await new Promise<'ok' | 'exit' | 'timeout'>((resolve) => {
+    // Watchdog: re-armed on every stream event (activity = alive). Suspended
+    // while an interactive dialog for this session is outstanding (the user may
+    // legitimately take minutes to answer — that's the dialog timeout's job,
+    // not the stall watchdog's).
+    let watchdog: ReturnType<typeof setTimeout> | null = null
+    const armWatchdog = () => {
+      if (watchdog) clearTimeout(watchdog)
+      watchdog = setTimeout(() => {
+        for (const pd of pendingDialogs.values()) {
+          if (pd.sessionId === sessionId) { armWatchdog(); return }  // waiting on user, not stalled
+        }
+        plog(`turn watchdog fired for session ${sessionId} after ${TURN_WATCHDOG_MS}ms of stream silence — tearing down`)
+        resolve('timeout')
+      }, TURN_WATCHDOG_MS)
+    }
     entry!.currentTurn = {
       onEvent(data) {
-        if (parser.handleEvent(data)) resolve('ok')
+        armWatchdog()
+        if (parser.handleEvent(data)) { if (watchdog) clearTimeout(watchdog); resolve('ok') }
       },
-      onExit() { resolve('exit') },
+      onExit() { if (watchdog) clearTimeout(watchdog); resolve('exit') },
     }
+    armWatchdog()
     try {
       entry!.push.push(text)
     } catch (e: any) {
       plog(`push failed for session ${sessionId}: ${e?.message || e}`)
+      if (watchdog) clearTimeout(watchdog)
       resolve('exit')
     }
   })
   entry.currentTurn = null
+
+  if (outcome === 'timeout') {
+    // Wedged stream: tear the session down (kills the SDK subprocess) and
+    // surface partial output. The next message rebuilds via resume.
+    if (persistentProcs.get(sessionId) === entry) killPersistentProc(sessionId, 'turn-watchdog')
+    parser.finalizeInterrupted('*(响应超时已中断 — 再发一条可继续)*')
+    if (!parser.hasOutput()) {
+      broadcastToSession(sessionId, { type: 'error', text: 'Claude 响应超时已中断，请重试；连续失败请检查电脑端服务' })
+    }
+    return true
+  }
 
   if (outcome === 'ok') {
     entry.busy = false
@@ -1085,6 +1157,22 @@ function killAllPersistentProcs(reason: string) {
 process.on('exit', () => killAllPersistentProcs('server-exit'))
 process.on('SIGINT', () => { killAllPersistentProcs('server-sigint'); process.exit(0) })
 process.on('SIGTERM', () => { killAllPersistentProcs('server-sigterm'); process.exit(0) })
+// SIGHUP (P2): terminal close / `kill -HUP` should also reap children, not
+// leave orphaned SDK subprocesses holding the port.
+process.on('SIGHUP', () => { killAllPersistentProcs('server-sighup'); process.exit(0) })
+// Last-ditch (P2): on an otherwise-fatal error, still attempt to reap children
+// before dying so we don't leak claude subprocesses / wedge the port. We log
+// and exit non-zero rather than limp on in an unknown state.
+process.on('uncaughtException', (err) => {
+  try { process.stderr.write(`[fatal] uncaughtException: ${err?.stack || err}\n`) } catch {}
+  killAllPersistentProcs('server-uncaught')
+  process.exit(1)
+})
+process.on('unhandledRejection', (reason) => {
+  try { process.stderr.write(`[fatal] unhandledRejection: ${(reason as any)?.stack || reason}\n`) } catch {}
+  // Don't exit on a stray rejection — log and keep serving; a single dropped
+  // promise (e.g. a client socket write) shouldn't take down every session.
+})
 
 // --- HTTP + WebSocket Server ---
 
@@ -1393,15 +1481,33 @@ Bun.serve({
       if (!sid) return json({ error: 'missing id' }, 400)
       if (!CLAUDE_SESSION_ID_RE.test(sid)) return json({ error: 'invalid id' }, 400)
       return (async () => {
+        // Busy guard (P2): recap does `claude -p --resume <sid>`, which forks a
+        // second process onto that session's .jsonl. If the session is busy in
+        // another terminal, that races writes — the same hazard the PATCH
+        // resume guard blocks. Refuse rather than risk corruption.
+        const busy = await externallyBusyClaudeSessionIds()
+        if (busy.has(sid)) return json({ recap: '（该会话正在其他终端运行中，暂不可生成摘要）' })
+
+        let proc: ReturnType<typeof spawn> | null = null
+        let timer: ReturnType<typeof setTimeout> | null = null
         try {
-          const proc = spawn({
+          proc = spawn({
             cmd: ['claude', '-p', '--resume', sid, '--output-format=stream-json', '--verbose', '--model', 'haiku'],
             cwd: WORK_DIR,
             stdin: new Response('Give a brief recap of this conversation in 2-3 sentences. What were we working on and what was the last thing we did? Reply in the same language the user used.'),
             stdout: 'pipe',
             stderr: 'pipe',
           })
-          const reader = proc.stdout.getReader()
+          const theProc = proc
+          // Timeout (P2): a hung recap must not leak an orphan claude process or
+          // a never-resolving request. Kill the whole tree on timeout.
+          let timedOut = false
+          timer = setTimeout(() => { timedOut = true; killProcTree(theProc) }, 60_000)
+          // Drain stderr (P2): an unread stderr pipe can fill and stall the
+          // child; we don't need the content, just keep it flowing.
+          ;(async () => { try { const r = (theProc.stderr as ReadableStream<Uint8Array>).getReader(); while (true) { const { done } = await r.read(); if (done) break } } catch {} })()
+
+          const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader()
           const decoder = new TextDecoder()
           let buffer = ''
           let result = ''
@@ -1420,8 +1526,12 @@ Bun.serve({
             }
           }
           await proc.exited
+          if (timer) { clearTimeout(timer); timer = null }
+          if (timedOut) return json({ recap: '（摘要生成超时）' })
           return json({ recap: result || 'Unable to generate recap' })
         } catch (e: any) {
+          if (timer) clearTimeout(timer)
+          if (proc) killProcTree(proc)
           return json({ recap: 'Error: ' + e.message })
         }
       })()
