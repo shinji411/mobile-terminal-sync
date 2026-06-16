@@ -1268,7 +1268,22 @@ Bun.serve({
           }
         }
         sessions.sort((a, b) => (b.lastMessageAt - a.lastMessageAt))
-        return json(sessions.slice(0, 30))
+        // Dedup conversation lineages: resuming a session forks a NEW .jsonl
+        // (new sessionId) that shares the same cwd + opening user message as its
+        // parent, so one conversation showed up as many near-identical "继续"
+        // rows. Collapse each lineage to a single entry — the most recently
+        // active one (the list is already sorted newest-first, so the first
+        // occurrence of a (cwd, firstMessage) key wins). Tie-break already
+        // handled by the sort; later/older forks are dropped.
+        const seenLineage = new Set<string>()
+        const deduped: any[] = []
+        for (const s of sessions) {
+          const key = (s.cwd || '') + ' ' + (s.firstMessage || s.sessionId)
+          if (seenLineage.has(key)) continue
+          seenLineage.add(key)
+          deduped.push(s)
+        }
+        return json(deduped.slice(0, 30))
       } catch {
         return json([])
       }

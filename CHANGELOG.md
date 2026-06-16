@@ -2,6 +2,14 @@
 
 ## [Unreleased] - 2026-06-15
 
+### Fixed (Computer Sessions list — duplicate conversation entries)
+- Resuming a session forks a new `.jsonl` (new sessionId) that shares its
+  parent's cwd + opening user message, so one conversation appeared as many
+  near-identical rows (a wall of "继续"). `/api/claude-sessions` now collapses
+  each lineage — keyed by `(cwd, firstMessage)` — to a single entry, keeping the
+  most recently active fork (empty firstMessage falls back to sessionId so
+  unrelated sessions are never merged). Verified on real data: 46 → 36 entries.
+
 ### Changed (migrate session engine to the Claude Agent SDK)
 - The per-session engine now uses `@anthropic-ai/claude-agent-sdk` `query()`
   with streaming input instead of hand-spawning `claude -p --input-format
