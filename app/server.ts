@@ -12,6 +12,7 @@
  */
 
 import { spawn } from 'bun'
+import { query, type Query, type SDKMessage, type SDKUserMessage, type PermissionResult } from '@anthropic-ai/claude-agent-sdk'
 import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, statSync, watch, realpathSync } from 'fs'
 import { readFile, readdir, stat as statAsync } from 'fs/promises'
 import { homedir } from 'os'
@@ -38,7 +39,6 @@ let seq = 0
 
 type SessionState = {
   isProcessing: boolean
-  proc: ReturnType<typeof spawn> | null
   aborted: boolean
   lastProcessedAt: number
   queue: string[]
@@ -159,12 +159,19 @@ async function cwdForClaudeSessionAsync(claudeSessionId: string): Promise<string
 // server. We must NOT count pocket-claude's OWN pool processes as "another
 // terminal": those PIDs live in persistentProcs. So we collect our own PIDs
 // and exclude any live record whose pid we own.
-function ownedClaudePids(): Set<number> {
-  const pids = new Set<number>()
+// NOTE: with the SDK we no longer hold the underlying claude subprocess PID
+// (the SDK owns it), so we can't subtract our own pool from the live-session
+// scan by PID. We instead exclude sessions we know we hold by their
+// claudeSessionId (tracked on each pool entry once the SDK reports it). This
+// keeps the resume-busy guard from blocking our own warm sessions while still
+// catching a genuinely external terminal.
+function ownedClaudeSessionIds(): Set<string> {
+  const ids = new Set<string>()
   for (const e of persistentProcs.values()) {
-    if (e.proc.pid) pids.add(e.proc.pid)
+    const cid = getSession(e.sessionId)?.claudeSessionId
+    if (cid) ids.add(cid)
   }
-  return pids
+  return ids
 }
 
 // Returns the set of claudeSessionIds that are busy in a process we do NOT
@@ -172,7 +179,7 @@ function ownedClaudePids(): Set<number> {
 // synchronous file I/O.
 async function externallyBusyClaudeSessionIds(): Promise<Set<string>> {
   const busy = new Set<string>()
-  const owned = ownedClaudePids()
+  const owned = ownedClaudeSessionIds()
   let files: string[]
   try {
     files = (await readdir(CLAUDE_SESSIONS_DIR)).filter(f => f.endsWith('.json'))
@@ -188,8 +195,9 @@ async function externallyBusyClaudeSessionIds(): Promise<Set<string>> {
       // processes aren't writing turn output, so resume contention is the
       // narrow case we block.
       if (status !== 'busy') continue
-      // Skip sessions backed by a process we own — that's not "another terminal".
-      if (typeof d.pid === 'number' && owned.has(d.pid)) continue
+      // Skip sessions we ourselves hold (matched by claudeSessionId) — that's
+      // not "another terminal".
+      if (owned.has(d.sessionId)) continue
       busy.add(d.sessionId)
     } catch {}
   }
@@ -237,7 +245,7 @@ function unwatchSession(sessionId: string) {
 
 function getSessionState(sessionId: string): SessionState {
   if (!sessionStates.has(sessionId)) {
-    sessionStates.set(sessionId, { isProcessing: false, proc: null, aborted: false, lastProcessedAt: 0, queue: [] })
+    sessionStates.set(sessionId, { isProcessing: false, aborted: false, lastProcessedAt: 0, queue: [] })
   }
   return sessionStates.get(sessionId)!
 }
@@ -591,119 +599,130 @@ function createTurnParser(sessionId: string, state: SessionState): TurnParser {
   }
 }
 
-// --- Persistent Claude processes (per-session, stream-json bidirectional) ---
-// One long-lived `claude -p --input-format stream-json` process per active
-// session eliminates the ~10-18s CLI cold start on every message. Messages
-// are written to stdin as JSON lines; a turn ends when a `result` event
-// arrives on stdout (the process stays alive waiting for the next message).
+// --- Persistent Claude sessions (per-session, Agent SDK query) ---
+// One long-lived SDK `query()` per active session eliminates the CLI cold
+// start on every message. We feed user turns through a streaming-input
+// AsyncIterable (sdkPush) and consume the query's SDKMessage stream; a turn
+// ends on a `result` message. The SDK manages the underlying claude
+// subprocess, resume, and the control protocol for us.
+//
+// This replaces the previous hand-rolled `claude -p --input-format stream-json`
+// spawn + stdin/stdout plumbing. The key win beyond simplicity: the SDK's
+// `canUseTool` callback gives us a clean hook to forward interactive requests
+// (AskUserQuestion prompts and tool-permission asks) to the phone — the raw
+// `-p` control_request path did NOT surface AskUserQuestion (verified), the
+// SDK canUseTool callback does, even under bypassPermissions.
 
 const MAX_PERSISTENT_PROCS = 3
 const PERSISTENT_IDLE_MS = 15 * 60 * 1000
 
-// --- Interactive dialogs / approvals (control_request protocol) ---
-// claude (2.1.x) speaks a bidirectional control protocol over the stream-json
-// stdin/stdout channel: it emits `{type:"control_request",request_id,request:
-// {subtype:...}}` and waits for us to write back a matching `control_response`.
-// Two subtypes matter to a phone bridge:
-//   - request_user_dialog (dialog_kind "ask_user_question" | "plan_dialog_choice"
-//     | "refusal_fallback_prompt"): Claude is ASKING the user something (e.g.
-//     the AskUserQuestion multiple-choice tool, or ExitPlanMode confirmation).
-//   - can_use_tool: a tool needs permission (only emitted in non-bypass modes).
-// We forward these to the phone, collect the answer, and write the response
-// back to stdin so the turn continues.
-//
-// CRITICAL fail-closed behavior (confirmed from the CLI binary): the CLI only
-// surfaces a dialog kind we DECLARE support for at init. An undeclared kind
-// "degrades to its no-dialog behavior" — i.e. Claude proceeds WITHOUT the
-// user's answer. That silent degradation is exactly why phone users never saw
-// AskUserQuestion prompts. We declare support via an `initialize` control
-// request right after spawn.
-//
-// Feature-flagged OFF by default until the initialize handshake is verified
-// against the live CLI — a malformed init could destabilize every turn.
-// Enable with POCKET_CLAUDE_DIALOGS=1.
-const DIALOGS_ENABLED = process.env.POCKET_CLAUDE_DIALOGS === '1'
-const SUPPORTED_DIALOG_KINDS = ['ask_user_question', 'plan_dialog_choice', 'refusal_fallback_prompt']
+// --- Interactive dialogs / approvals (canUseTool forwarding) ---
+// The SDK calls our canUseTool(toolName, input, opts) before a tool runs. For
+// AskUserQuestion the `input` carries { questions:[{question,header,options,
+// multiSelect}] } — we forward it to the phone as an approval_request, await
+// the user's answer, and resolve the callback with
+// {behavior:'allow', updatedInput:{...input, answers:{[question]:answer}}}.
+// For ordinary tool-permission asks (non-bypass modes) we forward toolName +
+// input and resolve allow/deny. The phone protocol (approval_request /
+// approval_response WS messages) is unchanged from the previous design — only
+// the server-side source moved from control_request to this callback.
 const DIALOG_TIMEOUT_MS = Number(process.env.POCKET_CLAUDE_DIALOG_TIMEOUT_MS ?? 5 * 60 * 1000)
 
 type PendingDialog = {
   requestId: string
   sessionId: string
-  entry: PersistentProc
-  subtype: string
+  resolve: (result: PermissionResult) => void
   timer: ReturnType<typeof setTimeout> | null
 }
 const pendingDialogs = new Map<string, PendingDialog>()
 
-function writeControlResponse(entry: PersistentProc, requestId: string, response: object) {
-  const line = JSON.stringify({
-    type: 'control_response',
-    response: { subtype: 'success', request_id: requestId, response },
-  }) + '\n'
-  try {
-    entry.stdin.write(line)
-    entry.stdin.flush()
-  } catch (e: any) {
-    plog(`control_response write failed for request ${requestId}: ${e?.message || e}`)
-  }
-}
-
-// Resolve a pending dialog (from a phone answer, timeout, or cancel). `response`
-// is the inner result object written back to the CLI, e.g.
-// {behavior:"allow",updatedInput:{...,answers:{...}}} or {behavior:"cancelled"}.
-function resolvePendingDialog(requestId: string, response: object) {
+// Resolve a pending dialog (from a phone answer, timeout, cancel, or session
+// teardown) by settling the canUseTool promise with a PermissionResult.
+function resolvePendingDialog(requestId: string, result: PermissionResult) {
   const pd = pendingDialogs.get(requestId)
   if (!pd) return
   if (pd.timer) clearTimeout(pd.timer)
   pendingDialogs.delete(requestId)
-  writeControlResponse(pd.entry, requestId, response)
+  pd.resolve(result)
 }
 
-// Handle an inbound control_request emitted on the CLI's stdout. Returns true
-// if it was a dialog/permission request we forwarded (so the stdout loop knows
-// not to treat it as a turn event).
-function handleControlRequest(entry: PersistentProc, data: any): boolean {
-  const requestId = data.request_id
-  const req = data.request || {}
-  const subtype = req.subtype
-  if (!requestId || !subtype) return false
-
-  if (subtype === 'request_user_dialog' || subtype === 'can_use_tool') {
-    const pd: PendingDialog = { requestId, sessionId: entry.sessionId, entry, subtype, timer: null }
-    pd.timer = setTimeout(() => {
-      plog(`dialog ${requestId} (${subtype}) timed out after ${DIALOG_TIMEOUT_MS}ms — auto-cancelling`)
-      resolvePendingDialog(requestId, { behavior: 'cancelled' })
-      broadcastToSession(entry.sessionId, { type: 'approval_cancelled', requestId })
-    }, DIALOG_TIMEOUT_MS)
-    pendingDialogs.set(requestId, pd)
-    // Forward to the phone. The payload differs per subtype; the client renders
-    // whichever fields are present (questions[] for dialogs, tool_name/input
-    // for can_use_tool).
-    broadcastToSession(entry.sessionId, {
-      type: 'approval_request',
-      requestId,
-      subtype,
-      dialogKind: req.dialog_kind || null,
-      toolName: req.tool_name || null,
-      displayName: req.display_name || null,
-      input: req.input ?? null,
-      payload: req.payload ?? null,
+// canUseTool handler: forward an interactive request to the phone and return a
+// promise that settles when the user answers (or on timeout). Bound per
+// session so we know where to broadcast.
+function makeCanUseTool(sessionId: string) {
+  return (toolName: string, input: Record<string, unknown>, _opts: any): Promise<PermissionResult> => {
+    const requestId = nextId()
+    return new Promise<PermissionResult>((resolve) => {
+      const timer = setTimeout(() => {
+        plog(`dialog ${requestId} (${toolName}) timed out after ${DIALOG_TIMEOUT_MS}ms — auto-cancelling`)
+        resolvePendingDialog(requestId, { behavior: 'deny', message: '已超时（手机未在限定时间内响应）' } as PermissionResult)
+        broadcastToSession(sessionId, { type: 'approval_cancelled', requestId })
+      }, DIALOG_TIMEOUT_MS)
+      pendingDialogs.set(requestId, { requestId, sessionId, resolve, timer })
+      // Forward to the phone. For AskUserQuestion the questions live in `input`;
+      // the client renders options + free-text. For other tools it renders a
+      // permission card (Allow / Deny) from toolName + input.
+      broadcastToSession(sessionId, {
+        type: 'approval_request',
+        requestId,
+        subtype: toolName === 'AskUserQuestion' ? 'request_user_dialog' : 'can_use_tool',
+        dialogKind: toolName === 'AskUserQuestion' ? 'ask_user_question' : null,
+        toolName,
+        displayName: toolName,
+        input,
+        // ui.ts renders question cards from payload.questions; mirror input there.
+        payload: toolName === 'AskUserQuestion' ? input : null,
+      })
     })
-    return true
   }
-  return false
 }
-
-type StdinSink = { write(s: string): unknown; flush(): unknown; end(): unknown }
 
 type TurnHooks = {
   onEvent: (data: any) => void
   onExit: () => void
 }
 
+// sdkPush is a streaming-input queue: an AsyncIterable<SDKUserMessage> we hand
+// to query(), plus a push() to enqueue the next user turn and an end() to
+// close the stream (terminating the query / subprocess).
+type SdkPush = {
+  iterable: AsyncIterable<SDKUserMessage>
+  push: (text: string) => void
+  end: () => void
+}
+
+function makeSdkPush(): SdkPush {
+  const queue: SDKUserMessage[] = []
+  let resolveNext: (() => void) | null = null
+  let closed = false
+  async function* gen(): AsyncIterable<SDKUserMessage> {
+    while (true) {
+      if (queue.length === 0) {
+        if (closed) return
+        await new Promise<void>(r => { resolveNext = r })
+        if (closed && queue.length === 0) return
+      }
+      const m = queue.shift()
+      if (m) yield m
+    }
+  }
+  return {
+    iterable: gen(),
+    push(text: string) {
+      queue.push({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] }, parent_tool_use_id: null, session_id: '' } as unknown as SDKUserMessage)
+      if (resolveNext) { const r = resolveNext; resolveNext = null; r() }
+    },
+    end() {
+      closed = true
+      if (resolveNext) { const r = resolveNext; resolveNext = null; r() }
+    },
+  }
+}
+
 type PersistentProc = {
-  proc: ReturnType<typeof spawn>
-  stdin: StdinSink
+  query: Query
+  push: SdkPush
+  abort: AbortController
   sessionId: string
   model: string
   permissionMode: string
@@ -719,97 +738,33 @@ type PersistentProc = {
 }
 
 const persistentProcs = new Map<string, PersistentProc>()
-let persistentSpawnFailures = 0
-// Kill switch: POCKET_CLAUDE_NO_PERSISTENT=1 forces the legacy one-shot
-// spawn path for every message (ops escape hatch / fallback testing).
-// This env-driven disable is permanent; the failure-driven degradation
-// below is half-open and auto-recovers.
-const persistentForceDisabled = process.env.POCKET_CLAUDE_NO_PERSISTENT === '1'
-
-// Half-open degradation latch: after repeated startup failures we degrade to
-// the one-shot path, but after DEGRADED_RETRY_MS the next message is allowed
-// one probe through the persistent path. Success clears the latch; failure
-// re-arms it for another window.
-const DEGRADED_RETRY_MS = 10 * 60 * 1000
-let degradedSince: number | null = null
-// Concurrency gate for the half-open probe: a probe turn can take 10-60s,
-// and without the gate every message from every session arriving in that
-// window would also be treated as a probe (concurrent doomed spawns +
-// duplicate failure registrations). While a probe is in flight, other
-// messages take the one-shot path directly.
-let probeInFlight = false
 const SERVER_STARTED_AT = Date.now()
 
 function plog(msg: string) {
-  process.stderr.write(`[${new Date().toISOString()}] [persistent] ${msg}\n`)
+  process.stderr.write(`[${new Date().toISOString()}] [sdk] ${msg}\n`)
 }
 
-function isDegraded(): boolean {
-  return persistentForceDisabled || degradedSince !== null
-}
-
-/** True if a degraded server should let this message probe the persistent path (half-open). */
-function shouldProbePersistent(): boolean {
-  if (persistentForceDisabled) return false
-  if (probeInFlight) return false
-  return degradedSince !== null && Date.now() - degradedSince >= DEGRADED_RETRY_MS
-}
-
-function registerPersistentFailure() {
-  persistentSpawnFailures++
-  if (degradedSince !== null) {
-    // Half-open probe failed — re-arm the window from now.
-    degradedSince = Date.now()
-    plog(`========== persistent mode probe FAILED — staying DEGRADED, next retry in ${DEGRADED_RETRY_MS / 60000}min ==========`)
-    return
-  }
-  if (persistentSpawnFailures >= 2) {
-    degradedSince = Date.now()
-    plog(`========== persistent mode DEGRADED after repeated startup failures — one-shot spawn for all messages, auto-retry in ${DEGRADED_RETRY_MS / 60000}min ==========`)
-    broadcastAll({ type: 'error', text: '已切换到兼容模式（响应较慢），10分钟后自动尝试恢复' })
-  }
-}
-
-function registerPersistentSuccess() {
-  persistentSpawnFailures = 0
-  if (degradedSince !== null) {
-    degradedSince = null
-    plog('========== persistent mode RECOVERED — half-open probe succeeded, leaving degraded mode ==========')
-    // Recovery is good news — use a neutral 'notice' type, not 'error' (which
-    // the UI renders red). The degraded broadcast below stays 'error' (red is
-    // correct for a degradation). Luna to add a 'notice' render branch in ui.ts.
-    broadcastAll({ type: 'notice', text: '已恢复正常模式（快速响应）' })
-  }
-}
-
-// Kill a process AND its descendants. claude.exe spawns children (node shim,
-// MCP servers, agent bash sessions) that hold their own handles — on Windows
-// proc.kill() only terminates the direct child, leaving orphans that keep the
-// port/socket handles alive. taskkill /T walks the tree; /F is required
-// because the orphans have no console to receive a soft signal.
-function killProcTree(proc: ReturnType<typeof spawn>) {
-  let treeKilled = false
-  if (process.platform === 'win32' && proc.pid) {
-    try {
-      const r = Bun.spawnSync(['taskkill', '/T', '/F', '/PID', String(proc.pid)])
-      treeKilled = r.exitCode === 0
-    } catch {}
-  }
-  // Fallback (non-Windows, or taskkill failed e.g. PID already gone):
-  // at minimum terminate the direct child.
-  if (!treeKilled) {
-    try { proc.kill() } catch {}
-  }
-}
-
+// Tear down an SDK session: interrupt any in-flight turn, close the input
+// stream (which ends the query and lets the SDK reap its subprocess), and
+// abort as a hard backstop. The SDK owns the underlying claude subprocess and
+// its descendants, so we no longer need taskkill /T tree-walking.
 function killPersistentProc(sessionId: string, reason: string) {
   const entry = persistentProcs.get(sessionId)
   if (!entry) return
   entry.expectedExit = true
   if (entry.idleTimer) { clearTimeout(entry.idleTimer); entry.idleTimer = null }
   persistentProcs.delete(sessionId)
-  plog(`killing proc tree for session ${sessionId} (pid=${entry.proc.pid}, reason=${reason}, pool=${persistentProcs.size})`)
-  killProcTree(entry.proc)
+  plog(`tearing down SDK session ${sessionId} (reason=${reason}, pool=${persistentProcs.size})`)
+  try { entry.query.interrupt?.() } catch {}
+  try { entry.push.end() } catch {}
+  try { entry.abort.abort() } catch {}
+  // Settle any dialogs awaiting an answer on this dead session.
+  for (const [rid, pd] of [...pendingDialogs]) {
+    if (pd.sessionId === sessionId) {
+      resolvePendingDialog(rid, { behavior: 'deny', message: '会话已结束' } as PermissionResult)
+      broadcastToSession(sessionId, { type: 'approval_cancelled', requestId: rid })
+    }
+  }
 }
 
 function evictLruIfNeeded() {
@@ -835,22 +790,34 @@ function armIdleTimer(entry: PersistentProc) {
 function spawnPersistentProc(sessionId: string, session: Session, cwd: string): PersistentProc {
   evictLruIfNeeded()
 
-  const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--include-partial-messages']
-  if (session.claudeSessionId) args.push('--resume', session.claudeSessionId)
-  if (session.model) args.push('--model', session.model)
-  if (session.permissionMode) args.push('--permission-mode', session.permissionMode)
+  const push = makeSdkPush()
+  const abort = new AbortController()
 
-  const proc = spawn({
-    cmd: ['claude', ...args],
-    cwd,
-    stdin: 'pipe',
-    stdout: 'pipe',
-    stderr: 'pipe',
+  const q = query({
+    prompt: push.iterable,
+    options: {
+      cwd,
+      abortController: abort,
+      includePartialMessages: true,
+      ...(session.claudeSessionId ? { resume: session.claudeSessionId } : {}),
+      ...(session.model ? { model: session.model } : {}),
+      ...(session.permissionMode ? { permissionMode: session.permissionMode as any } : {}),
+      canUseTool: makeCanUseTool(sessionId),
+      stderr: (data: string) => {
+        for (const l of String(data).split('\n')) {
+          const t = l.trim()
+          if (!t) continue
+          entry.stderrTail.push(t)
+          if (entry.stderrTail.length > 20) entry.stderrTail.shift()
+        }
+      },
+    },
   })
 
   const entry: PersistentProc = {
-    proc,
-    stdin: proc.stdin as unknown as StdinSink,
+    query: q,
+    push,
+    abort,
     sessionId,
     model: session.model || '',
     permissionMode: session.permissionMode || '',
@@ -865,121 +832,55 @@ function spawnPersistentProc(sessionId: string, session: Session, cwd: string): 
     stderrTail: [],
   }
   persistentProcs.set(sessionId, entry)
-  plog(`spawned proc for session ${sessionId} (pid=${proc.pid}, resume=${session.claudeSessionId || 'new'}, pool=${persistentProcs.size})`)
+  plog(`started SDK session ${sessionId} (resume=${session.claudeSessionId || 'new'}, pool=${persistentProcs.size})`)
 
-  // Declare which interactive dialog kinds we can render, so the CLI surfaces
-  // them as control_request instead of silently degrading to no-dialog
-  // behavior (its fail-closed default). Sent once per process lifetime, right
-  // after spawn. The CLI acks with a control_response (consumed and ignored in
-  // the stdout loop). Feature-flagged until verified against the live CLI.
-  if (DIALOGS_ENABLED) {
-    try {
-      const initLine = JSON.stringify({
-        type: 'control_request',
-        request_id: `pc-init-${nextId()}`,
-        request: { subtype: 'initialize', supportedDialogKinds: SUPPORTED_DIALOG_KINDS },
-      }) + '\n'
-      ;(proc.stdin as unknown as StdinSink).write(initLine)
-      ;(proc.stdin as unknown as StdinSink).flush()
-      plog(`sent initialize handshake for session ${sessionId} (dialogKinds=${SUPPORTED_DIALOG_KINDS.join(',')})`)
-    } catch (e: any) {
-      plog(`initialize handshake write failed for session ${sessionId}: ${e?.message || e}`)
-    }
-  }
-
-  // Drain stderr; keep a short tail for crash diagnostics
+  // Long-lived consumer loop. The SDK query is an AsyncGenerator<SDKMessage>;
+  // its message shapes (system/stream_event/assistant/result) match the raw
+  // stream-json events the turn parser already handles, so we feed each
+  // message straight to the active turn's onEvent. The loop spans the whole
+  // session lifetime (multiple turns over the streaming-input queue); it ends
+  // when the stream closes (push.end / interrupt / abort) or throws.
   ;(async () => {
     try {
-      const reader = proc.stderr.getReader()
-      const decoder = new TextDecoder()
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        for (const l of decoder.decode(value).split('\n')) {
-          const t = l.trim()
-          if (!t) continue
-          entry.stderrTail.push(t)
-          if (entry.stderrTail.length > 20) entry.stderrTail.shift()
-        }
-      }
-    } catch {}
-  })()
-
-  // Long-lived stdout read loop. getReader() is called exactly ONCE per
-  // process lifetime; parsed events are dispatched to whichever turn is
-  // currently active (entry.currentTurn). Reader state (decoder, partial
-  // line buffer) persists across turns.
-  ;(async () => {
-    try {
-      const reader = proc.stdout.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-        for (const line of lines) {
-          if (!line.trim()) continue
-          try {
-            const data = JSON.parse(line.trim())
-            entry.sawAnyEvent = true
-            // Intercept the bidirectional control protocol BEFORE turn parsing:
-            // control_request (dialogs / tool permission) is answered out-of-band
-            // and must not be fed to the turn parser as an assistant event.
-            if (DIALOGS_ENABLED && data.type === 'control_request') {
-              if (handleControlRequest(entry, data)) continue
-            }
-            // control_response from the CLI (acks to OUR control requests, e.g.
-            // the initialize handshake) — not a turn event either.
-            if (data.type === 'control_response') continue
-            entry.currentTurn?.onEvent(data)
-          } catch {}
-        }
+      for await (const msg of q as AsyncIterable<SDKMessage>) {
+        entry.sawAnyEvent = true
+        entry.currentTurn?.onEvent(msg)
       }
     } catch (e: any) {
-      plog(`stdout read loop error for session ${sessionId}: ${e?.message || e}`)
+      plog(`SDK consumer loop error for session ${sessionId}: ${e?.message || e}`)
+    } finally {
+      // Stream ended: behaves like the old proc.exited handler — drop the pool
+      // entry, settle pending dialogs, and complete the in-flight turn so the
+      // sender promise resolves.
+      if (persistentProcs.get(sessionId) === entry) persistentProcs.delete(sessionId)
+      if (entry.idleTimer) { clearTimeout(entry.idleTimer); entry.idleTimer = null }
+      for (const [rid, pd] of [...pendingDialogs]) {
+        if (pd.sessionId === sessionId) {
+          resolvePendingDialog(rid, { behavior: 'deny', message: '会话已结束' } as PermissionResult)
+          broadcastToSession(sessionId, { type: 'approval_cancelled', requestId: rid })
+        }
+      }
+      if (!entry.expectedExit) {
+        plog(`SDK session ${sessionId} ended unexpectedly (turns=${entry.successfulTurns})` +
+          (entry.stderrTail.length ? ` stderr: ${entry.stderrTail.slice(-3).join(' | ')}` : ''))
+      }
+      entry.currentTurn?.onExit()
     }
   })()
-
-  // Crash self-heal: on any exit, remove the pool entry and complete the
-  // in-flight turn (if any). The next message re-spawns with --resume on
-  // the latest claudeSessionId, so conversation context survives.
-  proc.exited.then((code) => {
-    if (persistentProcs.get(sessionId) === entry) persistentProcs.delete(sessionId)
-    if (entry.idleTimer) { clearTimeout(entry.idleTimer); entry.idleTimer = null }
-    // Any dialogs awaiting an answer on this dead process can never be
-    // answered — clear their timers and tell the phone to dismiss them.
-    for (const [rid, pd] of [...pendingDialogs]) {
-      if (pd.entry === entry) {
-        if (pd.timer) clearTimeout(pd.timer)
-        pendingDialogs.delete(rid)
-        broadcastToSession(entry.sessionId, { type: 'approval_cancelled', requestId: rid })
-      }
-    }
-    if (!entry.expectedExit) {
-      plog(`proc for session ${sessionId} exited unexpectedly (code=${code}, turns=${entry.successfulTurns})` +
-        (entry.stderrTail.length ? ` stderr: ${entry.stderrTail.slice(-3).join(' | ')}` : ''))
-    }
-    entry.currentTurn?.onExit()
-  })
 
   return entry
 }
 
 /**
- * Run one turn through the per-session persistent process.
+ * Run one turn through the per-session SDK query.
  * Returns true if the turn was fully handled (success, abort, or
- * mid-conversation crash with partial output preserved).
- * Returns false if the caller should fall back to the one-shot spawn path
- * (spawn failure, or a fresh process died before producing any output —
- * e.g. stream-json input unsupported by the installed claude version).
+ * mid-conversation stream end with partial output preserved). Returns false
+ * only if the session could not be created at all (caller surfaces an error).
  */
 async function sendViaPersistent(text: string, sessionId: string, state: SessionState, session: Session, sessionCwd: string | null): Promise<boolean> {
   // Normalize: cwd from jsonl uses backslashes, WORK_DIR may use forward
   // slashes — without resolve() the comparison below would false-positive
-  // "params changed" and needlessly kill the warm process.
+  // "params changed" and needlessly tear down the warm session.
   const wantCwd = resolve(sessionCwd || WORK_DIR)
   const wantModel = session.model || ''
   const wantPerm = session.permissionMode || ''
@@ -990,14 +891,12 @@ async function sendViaPersistent(text: string, sessionId: string, state: Session
     entry = undefined
   }
 
-  let fresh = false
   if (!entry) {
     try {
       entry = spawnPersistentProc(sessionId, session, wantCwd)
-      fresh = true
     } catch (e: any) {
-      plog(`spawn failed for session ${sessionId}: ${e?.message || e}`)
-      registerPersistentFailure()
+      plog(`SDK session start failed for ${sessionId}: ${e?.message || e}`)
+      broadcastToSession(sessionId, { type: 'error', text: '无法启动 Claude 会话，请检查电脑端服务' })
       return false
     }
   }
@@ -1005,7 +904,6 @@ async function sendViaPersistent(text: string, sessionId: string, state: Session
   entry.busy = true
   entry.lastUsedAt = Date.now()
   if (entry.idleTimer) { clearTimeout(entry.idleTimer); entry.idleTimer = null }
-  state.proc = entry.proc
 
   const parser = createTurnParser(sessionId, state)
   const turnStart = Date.now()
@@ -1018,11 +916,9 @@ async function sendViaPersistent(text: string, sessionId: string, state: Session
       onExit() { resolve('exit') },
     }
     try {
-      const line = JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } }) + '\n'
-      entry!.stdin.write(line)
-      entry!.stdin.flush()
+      entry!.push.push(text)
     } catch (e: any) {
-      plog(`stdin write failed for session ${sessionId}: ${e?.message || e}`)
+      plog(`push failed for session ${sessionId}: ${e?.message || e}`)
       resolve('exit')
     }
   })
@@ -1033,157 +929,33 @@ async function sendViaPersistent(text: string, sessionId: string, state: Session
     entry.successfulTurns++
     entry.lastUsedAt = Date.now()
     armIdleTimer(entry)
-    registerPersistentSuccess()
-    plog(`turn done for session ${sessionId} in ${((Date.now() - turnStart) / 1000).toFixed(1)}s (pid=${entry.proc.pid}, turns=${entry.successfulTurns})`)
+    plog(`turn done for session ${sessionId} in ${((Date.now() - turnStart) / 1000).toFixed(1)}s (turns=${entry.successfulTurns})`)
     if (!parser.hasOutput()) {
-      // Turn "completed" but produced nothing user-visible (e.g.
-      // error_during_execution with empty result) — tell the phone instead
-      // of silently going back to idle.
-      plog(`ZERO-OUTPUT turn for session ${sessionId} despite result event` +
+      // Turn "completed" but produced nothing user-visible (e.g. error result).
+      plog(`ZERO-OUTPUT turn for session ${sessionId} despite result message` +
         (entry.stderrTail.length ? ` — stderr tail: ${entry.stderrTail.slice(-8).join(' | ')}` : ''))
       broadcastToSession(sessionId, { type: 'error', text: 'Claude 本轮没有返回任何内容，请重试；连续失败请检查电脑端服务' })
     }
     return true
   }
 
-  // Process exited before producing a result for this turn.
-  //
-  // Capture expectedExit BEFORE the cleanup below sets it: a true value here
-  // means an EXTERNAL deliberate kill (PATCH params change, DELETE, LRU,
-  // idle) raced this turn — that must not count as a persistent-mode
-  // failure. The cleanup's own kill is not "deliberate" in that sense.
-  const externallyKilled = entry.expectedExit
-
-  // Safety net for ALL 'exit' outcomes: the 'exit' signal can also come from
-  // an stdin write failure with the process STILL ALIVE (see the catch in
-  // the promise above). In that case proc.exited never fires, so the pool
-  // entry would stay in the map forever with busy=true — a zombie that LRU
-  // skips, the idle timer never reaps, and every later message re-hits.
-  // killPersistentProc removes the entry, kills the process tree, and is a
-  // no-op when the process really died (the exited handler already removed
-  // the entry, so the map no longer holds `entry`).
+  // Stream ended before producing a result for this turn (abort or crash).
   const stillInPool = persistentProcs.get(sessionId) === entry
-  plog(`turn exit outcome for session ${sessionId} (stillInPool=${stillInPool}, aborted=${state.aborted}, fresh=${fresh})`)
-  if (stillInPool) {
-    plog(`turn-exit cleanup: entry for session ${sessionId} still in pool after exit outcome (stdin write failure with live process?) — force-killing`)
-    killPersistentProc(sessionId, 'turn-exit-cleanup')
-  }
+  plog(`turn exit outcome for session ${sessionId} (stillInPool=${stillInPool}, aborted=${state.aborted})`)
+  if (stillInPool) killPersistentProc(sessionId, 'turn-exit-cleanup')
 
   if (state.aborted) {
     parser.finalizeInterrupted()
     return true
   }
-  if (fresh && entry.successfulTurns === 0 && !entry.sawAnyEvent) {
-    // Fresh process died before ANY stdout output — most likely the
-    // stream-json input mode is unavailable, OR it was deliberately killed
-    // (e.g. PATCH model change landing in the startup window). Fall back to
-    // one-shot either way, but only count a failure toward degradation when
-    // the death was NOT a deliberate kill — otherwise two quick settings
-    // saves would falsely degrade the whole server for 10 minutes.
-    // proc.exited is normally already resolved here (onExit fired from its
-    // .then), but after an stdin-write-failure the cleanup above just killed
-    // the process — race a timeout to avoid hanging on a slow reap.
-    const exitCode = await Promise.race([
-      entry.proc.exited,
-      new Promise<string>(r => setTimeout(() => r('?'), 1000)),
-    ])
-    plog(`fresh proc for session ${sessionId} died before any output (exit=${exitCode}, expectedExit=${externallyKilled}) — falling back to one-shot` +
-      (entry.stderrTail.length ? `\n  stderr tail: ${entry.stderrTail.slice(-8).join('\n  stderr tail: ')}` : ' (no stderr captured)'))
-    if (!externallyKilled) registerPersistentFailure()
-    return false
-  }
   // Mid-conversation crash: surface what we have; the next message rebuilds
-  // the process with --resume, so context is not lost.
-  plog(`proc for session ${sessionId} crashed mid-turn — partial output preserved, will rebuild on next message`)
+  // the session with resume, so context is not lost.
+  plog(`SDK session ${sessionId} ended mid-turn — partial output preserved, will rebuild on next message`)
   parser.finalizeInterrupted('*(connection lost — send again to continue)*')
   if (!parser.hasOutput()) {
-    broadcastToSession(sessionId, { type: 'error', text: 'Claude 进程在响应前异常退出，请重试；连续失败请检查电脑端服务' })
+    broadcastToSession(sessionId, { type: 'error', text: 'Claude 会话在响应前异常结束，请重试；连续失败请检查电脑端服务' })
   }
   return true
-}
-
-/**
- * Legacy one-shot path: spawn `claude -p`, write the message once, read
- * stdout to EOF. Kept as the fallback when the persistent path is
- * unavailable. Do not delete.
- */
-async function sendViaOneShot(text: string, sessionId: string, state: SessionState, session: Session, sessionCwd: string | null) {
-  const args = ['-p', '--output-format=stream-json', '--verbose', '--include-partial-messages']
-  if (session.claudeSessionId) {
-    args.push('--resume', session.claudeSessionId)
-  }
-  if (session.model) {
-    args.push('--model', session.model)
-  }
-  if (session.permissionMode) {
-    args.push('--permission-mode', session.permissionMode)
-  }
-
-  const proc = spawn({
-    cmd: ['claude', ...args],
-    cwd: sessionCwd || WORK_DIR,
-    stdin: new Response(text),
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  state.proc = proc
-
-  // Capture stderr (tail only) for crash diagnostics — without this, a
-  // claude that exits instantly (e.g. env/config failure) leaves zero trace.
-  let stderrTail = ''
-  const stderrDone = (async () => {
-    try {
-      const reader = proc.stderr.getReader()
-      const decoder = new TextDecoder()
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        stderrTail += decoder.decode(value, { stream: true })
-        if (stderrTail.length > 2048) stderrTail = stderrTail.slice(-2048)
-      }
-    } catch {}
-  })()
-
-  const parser = createTurnParser(sessionId, state)
-  const reader = proc.stdout.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    if (state.aborted) continue
-
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() || ''
-
-    for (const line of lines) {
-      if (!line.trim() || state.aborted) continue
-      try {
-        parser.handleEvent(JSON.parse(line.trim()))
-      } catch {}
-    }
-  }
-
-  const exitCode = await proc.exited
-  await stderrDone
-
-  if (state.aborted) {
-    parser.finalizeInterrupted()
-    return
-  }
-
-  // Zero-output turn: the user saw thinking→idle with nothing in between.
-  // Surface an error event to the phone and the diagnostics to the log.
-  if (!parser.hasOutput()) {
-    plog(`one-shot ZERO-OUTPUT for session ${sessionId} (exit=${exitCode})` +
-      (stderrTail.trim() ? `\n  stderr tail: ${stderrTail.trim().split('\n').join('\n  stderr tail: ')}` : ' (no stderr captured)'))
-    const desc = exitCode === 0
-      ? 'Claude 没有返回任何内容，请重试；连续失败请检查电脑端服务'
-      : `Claude 进程异常退出 (exit ${exitCode})，请稍后重试；连续失败请检查电脑端服务`
-    broadcastToSession(sessionId, { type: 'error', text: desc })
-  }
 }
 
 async function sendToClaude(text: string, sessionId: string) {
@@ -1211,35 +983,14 @@ async function sendToClaude(text: string, sessionId: string) {
   if (sessionCwd && !existsSync(sessionCwd)) sessionCwd = undefined
 
   try {
-    let handled = false
-    const isProbe = isDegraded() && shouldProbePersistent()
-    const tryPersistent = !isDegraded() || isProbe
-    if (tryPersistent) {
-      if (isProbe) {
-        probeInFlight = true
-        plog(`degraded ${Math.round((Date.now() - (degradedSince ?? Date.now())) / 1000)}s — half-open probe via persistent path for session ${sessionId}`)
-      }
-      try {
-        handled = await sendViaPersistent(text, sessionId, state, session, sessionCwd || null)
-      } catch (e: any) {
-        plog(`persistent path error for session ${sessionId}: ${e?.message || e}`)
-        handled = false
-      } finally {
-        if (isProbe) probeInFlight = false
-      }
-    }
-    if (!handled) {
-      plog(`using one-shot spawn for session ${sessionId}`)
-      await sendViaOneShot(text, sessionId, state, session, sessionCwd || null)
-    }
+    await sendViaPersistent(text, sessionId, state, session, sessionCwd || null)
   } catch (e: any) {
-    // Both paths failed hard (e.g. claude binary missing) — never leave the
-    // phone staring at thinking→idle with no explanation.
+    // SDK session failed hard — never leave the phone staring at
+    // thinking→idle with no explanation.
     plog(`sendToClaude error for session ${sessionId}: ${e?.message || e}`)
-    broadcastToSession(sessionId, { type: 'error', text: '无法启动 Claude 进程，请检查电脑端服务' })
+    broadcastToSession(sessionId, { type: 'error', text: '无法启动 Claude 会话，请检查电脑端服务' })
   }
 
-  state.proc = null
   state.isProcessing = false
   state.lastProcessedAt = Date.now()
 
@@ -1272,32 +1023,17 @@ function abortClaude(sessionId: string) {
   const state = getSessionState(sessionId)
   state.queue = []
 
-  // Persistent path: kill the whole process. The exited handler completes
-  // the in-flight turn (if any); the next message rebuilds via --resume.
   const entry = persistentProcs.get(sessionId)
-  if (entry) {
-    if (state.isProcessing) state.aborted = true
-    killPersistentProc(sessionId, 'user-abort')
-    return
-  }
-
-  // One-shot path
-  if (!state.proc || !state.isProcessing) return
-  state.aborted = true
-  // Capture the proc being aborted — by the time the 5s fallback fires, the
-  // turn may have ended and state.proc may already point at a NEW process
-  // (possibly a warm pool member). Only escalate on the original target.
-  const procAtAbort = state.proc
-  procAtAbort.kill('SIGINT')
-  setTimeout(() => {
-    if (state.proc === procAtAbort && !procAtAbort.killed) {
-      procAtAbort.kill('SIGTERM')
-    }
-  }, 5000)
+  if (!entry) return
+  // Mark aborted so the in-flight turn finalizes as interrupted, then tear
+  // down the SDK session. The next message rebuilds via resume, so context
+  // is not lost.
+  if (state.isProcessing) state.aborted = true
+  killPersistentProc(sessionId, 'user-abort')
 }
 
-// Reap all persistent children when the server itself goes down — orphaned
-// claude.exe processes would otherwise keep running on Windows.
+// Tear down all SDK sessions when the server itself goes down. The SDK reaps
+// its own claude subprocesses on query end / abort.
 function killAllPersistentProcs(reason: string) {
   for (const sid of [...persistentProcs.keys()]) killPersistentProc(sid, reason)
 }
@@ -1343,9 +1079,9 @@ Bun.serve({
 
     if (url.pathname === '/api/health' && req.method === 'GET') {
       return json({
-        mode: isDegraded() ? 'degraded' : 'persistent',
-        degradedSince,
+        mode: 'sdk',
         pool: { size: persistentProcs.size, max: MAX_PERSISTENT_PROCS },
+        pendingDialogs: pendingDialogs.size,
         uptime: Math.round((Date.now() - SERVER_STARTED_AT) / 1000),
       })
     }
@@ -1705,25 +1441,25 @@ Bun.serve({
         // Answer to a forwarded dialog / tool-permission request. The phone
         // (which holds the full request payload) sends
         //   { requestId, decision: 'allow'|'deny'|'cancel', updatedInput?, message? }
-        // and we wrap it into the CLI's control_response inner shape, writing
-        // it back to the owning persistent process's stdin.
-        //   - allow:     { behavior:'allow', updatedInput:{...} }
-        //                 (for ask_user_question updatedInput carries
-        //                  { ...toolInput, answers:{ [question]: answer } })
-        //   - deny:      { behavior:'deny', message:'...' }
-        //   - cancel:    { behavior:'cancelled' }
+        // and we settle the SDK canUseTool promise with a PermissionResult:
+        //   - allow:  { behavior:'allow', updatedInput:{...} }
+        //             (for AskUserQuestion updatedInput carries
+        //              { ...toolInput, answers:{ [question]: answer } })
+        //   - deny:   { behavior:'deny', message:'...' }
+        //   - cancel: mapped to deny (canUseTool has no 'cancelled' result; a
+        //             cancelled AskUserQuestion just declines to answer).
         if (data.type === 'approval_response') {
           const pd = pendingDialogs.get(data.requestId)
-          if (!pd) return                 // already resolved / timed out / proc died
-          let response: object
+          if (!pd) return                 // already resolved / timed out / session ended
+          let result: PermissionResult
           if (data.decision === 'deny') {
-            response = { behavior: 'deny', message: data.message || 'Denied by user' }
+            result = { behavior: 'deny', message: data.message || 'Denied by user' } as PermissionResult
           } else if (data.decision === 'cancel') {
-            response = { behavior: 'cancelled' }
+            result = { behavior: 'deny', message: '已取消' } as PermissionResult
           } else {
-            response = { behavior: 'allow', updatedInput: data.updatedInput ?? {} }
+            result = { behavior: 'allow', updatedInput: data.updatedInput ?? {} } as PermissionResult
           }
-          resolvePendingDialog(data.requestId, response)
+          resolvePendingDialog(data.requestId, result)
           return
         }
 

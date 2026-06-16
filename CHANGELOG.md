@@ -2,6 +2,27 @@
 
 ## [Unreleased] - 2026-06-15
 
+### Changed (migrate session engine to the Claude Agent SDK)
+- The per-session engine now uses `@anthropic-ai/claude-agent-sdk` `query()`
+  with streaming input instead of hand-spawning `claude -p --input-format
+  stream-json`. The SDK owns the claude subprocess, resume, and the control
+  protocol; the server feeds user turns through an AsyncIterable and consumes
+  the `SDKMessage` stream (whose shapes match the old raw events, so the turn
+  parser is reused unchanged).
+- **Interactive dialogs / approvals now actually work on the phone.** The SDK's
+  `canUseTool` callback surfaces AskUserQuestion (multiple-choice + free-text)
+  and tool-permission asks; the server forwards them as `approval_request`,
+  awaits the phone's `approval_response`, and resolves the callback with
+  `{behavior:'allow', updatedInput:{...input, answers:{...}}}` (or deny). This
+  replaces the raw-CLI `control_request` scaffold, which (verified) never
+  surfaced AskUserQuestion in `-p` mode. Confirmed working end-to-end **under
+  `bypassPermissions`** — ordinary tools still run automatically, but Claude's
+  questions reach the phone.
+- Removed the one-shot fallback path and the persistent-mode degradation latch
+  (SDK is the sole, reliable engine); abort now uses `Query.interrupt()` and
+  stream teardown instead of taskkill tree-walking; `/api/health` reports
+  `mode:'sdk'` + pending-dialog count.
+
 ### Fixed (realtime layer — phone "reconnecting" / stale session / dropped messages)
 - **WS keep-alive**: added `idleTimeout: 300` to the Bun `websocket` config + a
   client-side 25s ping/pong heartbeat. Bun's default ~120s idle close was tearing
