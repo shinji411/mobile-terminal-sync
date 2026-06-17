@@ -1195,15 +1195,13 @@ Bun.serve({
     }
 
     if (url.pathname === '/manifest.json') {
-      // H1: don't advertise app metadata to unauthenticated tailnet peers.
-      // The browser's declarative `<link rel="manifest">` fetch is same-origin
-      // and carries no token, so an already-installed PWA re-fetching the
-      // manifest would 401 — but that fetch is non-credentialed by design and
-      // only affects install-time metadata, not the running app. We gate it so
-      // a bare GET /manifest.json from an unpaired peer reveals nothing.
-      if (!isAuthorized(req, url)) {
-        return new Response('unauthorized', { status: 401 })
-      }
+      // H1 (intentionally NOT gated): the manifest carries no secret, the
+      // browser's declarative `<link rel="manifest">` fetch is non-credentialed
+      // so gating it would 401 the installed PWA's metadata refresh (icon/name/
+      // theme) for zero gain — `/` (the shell) is already served openly, and the
+      // real protection lives on /ws + /api/* which ARE token-gated. In a
+      // single-account tailnet, hiding app metadata from your own peers buys
+      // nothing, so we keep install fidelity instead.
       return new Response(MANIFEST, { headers: { 'content-type': 'application/manifest+json' } })
     }
 
