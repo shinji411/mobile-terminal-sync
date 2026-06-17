@@ -1195,10 +1195,26 @@ Bun.serve({
     }
 
     if (url.pathname === '/manifest.json') {
+      // H1: don't advertise app metadata to unauthenticated tailnet peers.
+      // The browser's declarative `<link rel="manifest">` fetch is same-origin
+      // and carries no token, so an already-installed PWA re-fetching the
+      // manifest would 401 — but that fetch is non-credentialed by design and
+      // only affects install-time metadata, not the running app. We gate it so
+      // a bare GET /manifest.json from an unpaired peer reveals nothing.
+      if (!isAuthorized(req, url)) {
+        return new Response('unauthorized', { status: 401 })
+      }
       return new Response(MANIFEST, { headers: { 'content-type': 'application/manifest+json' } })
     }
 
     if (url.pathname === '/') {
+      // H1: the HTML shell embeds NO secret (the token only ever lives in the
+      // stderr banner and is supplied by the client via ?token= / stored token).
+      // We MUST keep serving it without a token: the home-screen PWA relaunches
+      // by loading `/` with no ?token=, and its bootstrap JS (ui.ts) reads the
+      // token from localStorage/sessionStorage to authenticate /ws and /api/*
+      // (which ARE gated). Hard-403 here would brick the installed app for zero
+      // gain, since the shell is just non-sensitive bootstrap code.
       return new Response(HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } })
     }
 
@@ -1561,6 +1577,14 @@ Bun.serve({
             }))
           return json({ type: 'dir', path: reqPath, entries })
         } else {
+          // The directory listing above hides dotfiles + config.hiddenFiles, but the
+          // file-read branch would otherwise return ANY file under workDir by exact
+          // path (.env, .git/*, .aws/* ...). Apply the same filter to every path
+          // segment relative to the work dir before reading.
+          const segments = relative(WORK_DIR_REAL, fullPath).split(sep)
+          if (segments.some(s => s.startsWith('.') || config.hiddenFiles.includes(s))) {
+            return json({ error: 'forbidden' }, 403)
+          }
           const MAX_SIZE = config.maxFileSize
           if (stat.size > MAX_SIZE) {
             return json({ type: 'file', path: reqPath, tooLarge: true, size: stat.size })
@@ -1777,9 +1801,19 @@ Bun.serve({
 })
 
 process.stderr.write(`\npocket-claude v1.0.0 started\n`)
-process.stderr.write(`URL: http://${HOST}:${PORT}?token=${TOKEN}\n`)
-process.stderr.write(`Working directory: ${WORK_DIR}\n`)
-if (config.tailscaleIp) {
-  process.stderr.write(`\nOpen on iPhone: http://${config.tailscaleIp}:${PORT}?token=${TOKEN}\n`)
+// One token = full RCE. Only print the token-bearing URL to an interactive
+// terminal. When run as a daemon (run.sh -d redirects stderr into a
+// world-readable server.log) print a token-free line instead, so the secret
+// never lands in the log. start-pocket-mac.sh reads the token file directly
+// for pairing, so gating here does not break the pairing flow.
+if (process.stdout.isTTY) {
+  process.stderr.write(`URL: http://${HOST}:${PORT}?token=${TOKEN}\n`)
+  process.stderr.write(`Working directory: ${WORK_DIR}\n`)
+  if (config.tailscaleIp) {
+    process.stderr.write(`\nOpen on iPhone: http://${config.tailscaleIp}:${PORT}?token=${TOKEN}\n`)
+  }
+} else {
+  process.stderr.write(`pocket-claude listening on ${HOST}:${PORT} — token in ~/.claude/channels/pocket-claude/token\n`)
+  process.stderr.write(`Working directory: ${WORK_DIR}\n`)
 }
 process.stderr.write(`\n`)
